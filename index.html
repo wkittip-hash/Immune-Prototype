@@ -1,0 +1,2641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Immune Colony</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Chakra+Petch:wght@700&display=swap">
+<style>
+  /* One-screen game: the canvas is scaled to fit the window, keeping 1280x760. */
+  :root {
+    --ground: #0d090e;
+    --frame: #4e445e;
+    --focus: #7d7196;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--ground);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding-block: 16px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    max-width: min(100%, calc((100dvh - 32px) * 1280 / 760));
+    aspect-ratio: 1280 / 760;
+    height: auto;
+    border-radius: 10px;
+    box-shadow: 0 0 0 1px var(--frame);
+    touch-action: none;
+    cursor: default;
+    outline: none;
+  }
+  canvas:focus-visible { box-shadow: 0 0 0 1px var(--focus); }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="760" tabindex="0" aria-label="Immune Colony game"></canvas>
+<script>
+"use strict";
+// =========================================================================
+// Immune Colony - browser version (ported from the pygame prototype v4)
+// =========================================================================
+
+// ------------------------------- CONFIG ---------------------------------
+const WIDTH = 1280, HEIGHT = 760;
+const TILE = 32;
+const MAP_W = 60, MAP_H = 40;
+const WORLD_W = MAP_W * TILE, WORLD_H = MAP_H * TILE;
+const TOP_H = 48, BOTTOM_H = 136;
+const VIEW_W = WIDTH, VIEW_H = HEIGHT - TOP_H - BOTTOM_H;
+const MM_W = 186, MM_H = 124;
+const CAM_SPEED = 650;
+const WIN_WAVE = 15;
+const FIRST_WAVE_DELAY = 100.0;
+const LEASH = 420;
+// Blood supply: nutrients are delivered by the blood, not collected by cells.
+// Capillary Beds must touch a blood vessel; each vessel tile they touch adds flow.
+const CAP_BASE = { atp: 1.0, bio: 0.7 };   // "atp" = glucose, "bio" = amino acids
+const CAP_PER_VESSEL = 0.15;
+const CAP_MAX_VESSELS = 6;
+const ARTERIOLE_BOOST = 0.5;
+const VIRION_LIFE = 75.0;          // free virus decays outside a cell
+const ACTIVATION_TIME = 45.0;      // primary adaptive response (~1 week, compressed)
+const IFN_RADIUS = 140;
+const IFN_TIME = 25.0;
+
+const T_TISSUE = 0, T_VESSEL = 1;
+
+// Internal resource keys stay "atp"/"bio" but mean blood GLUCOSE and AMINO ACIDS.
+// In real life each cell makes its own ATP from glucose + oxygen; ATP is never shared.
+const RES_SHORT = { atp: "Glu", bio: "AA" };
+
+const WHITE = [240, 240, 245], BLACK = [12, 10, 14], BG = [20, 14, 20];
+const PANEL = [30, 26, 36], PANEL_LIGHT = [48, 42, 58], PANEL_EDGE = [78, 68, 94];
+const GREY = [130, 126, 140], RED = [225, 70, 70], GREEN = [100, 215, 130];
+const YELLOW = [240, 205, 80], CYAN = [90, 210, 225], ORANGE = [240, 150, 60];
+const INFECT = [190, 80, 210], IFN_COL = [110, 180, 255];
+
+const DIFFICULTY = {
+  Easy:   { wave_mult: 0.7,  start: 220, hp_mult: 0.85 },
+  Normal: { wave_mult: 1.0,  start: 170, hp_mult: 1.0 },
+  Hard:   { wave_mult: 1.35, start: 130, hp_mult: 1.15 },
+};
+
+const FAMILY_COLORS = { A: [225, 70, 70], B: [240, 140, 60], C: [230, 90, 170], D: [210, 200, 80] };
+
+const FACTS = [
+  "A virus can't reproduce on its own - it hijacks a living cell's machinery.",
+  "Fever is a defense: many viruses replicate more slowly at higher temperatures.",
+  "Vaccines train B and T cells to recognise a pathogen before you ever meet it.",
+  "Influenza drifts a little every year, which is why the flu vaccine is updated yearly.",
+  "Lymph nodes swell during infection because T and B cells are multiplying inside them.",
+  "Interferon was named because it 'interferes' with viral replication in nearby cells.",
+  "A first (primary) adaptive response takes about a week; a memory response takes a day or two.",
+  "After an infection is cleared, about 90-95% of effector T cells die - only memory cells stay.",
+  "HIV infects Helper T (CD4+) cells, so the whole adaptive response slowly fails.",
+  "Neutrophils mostly fight bacteria; against viruses, interferon, NK and T cells matter more.",
+  "Every cell makes its own ATP - it is never shared. ATP leaking out of cells is an alarm " +
+    "signal that tells immune cells something is damaged.",
+  "Blood plasma carries glucose and amino acids to every tissue; red blood cells carry oxygen.",
+  "Inflamed tissue turns red and warm because arterioles widen and bring in more blood.",
+];
+
+// ------------------------------- DATA -----------------------------------
+// role: "eat" (free virus), "antibody" (neutralize free virus of a learned
+// strain), "kill" (infected cells), "present" (carry antigen to lymph node)
+const CELL_TYPES = {
+  neutrophil: {
+    simple: "Swarm Cell", medical: "Neutrophil", branch: "innate",
+    desc: "Fast first responder that eats free virus. Lives only about a minute.",
+    fact: "Neutrophils arrive first but only live a day or two - pus is mostly dead " +
+          "neutrophils. They matter more against bacteria than viruses.",
+    color: [235, 235, 240], shape: "circle",
+    hp: 16, dmg: 5, speed: 120, rng: 16, atk_cd: 0.5, role: "eat", life: 55,
+  },
+  macrophage: {
+    simple: "Eater Cell", medical: "Macrophage", branch: "innate",
+    desc: "Slow, long-lived eater of free virus. Twice as fast on antibody-tagged virus.",
+    fact: "Macrophages swallow pathogens whole (phagocytosis). Antibody-coated virus " +
+          "is much easier to grab - this is called opsonization.",
+    color: [230, 190, 60], shape: "circle",
+    hp: 60, dmg: 8, speed: 55, rng: 18, atk_cd: 0.6, role: "eat",
+  },
+  dendritic: {
+    simple: "Scout Cell", medical: "Dendritic Cell", branch: "innate",
+    desc: "Grabs a piece of the virus (antigen) and carries it to the lymph node " +
+          "to start the adaptive response.",
+    fact: "Dendritic cells link innate and adaptive immunity: they show antigen to " +
+          "T cells inside the lymph node.",
+    color: [110, 215, 200], shape: "star",
+    hp: 20, dmg: 0, speed: 85, rng: 14, atk_cd: 0.5, role: "present",
+  },
+  nk: {
+    simple: "Hunter Cell", medical: "Natural Killer (NK) Cell", branch: "innate",
+    desc: "Kills infected cells. Weak against normal-looking cells, very strong vs " +
+          "cells hiding their MHC-I tag. Can't touch free virus.",
+    fact: "NK cells check each cell for its MHC-I 'ID card'. Viruses often remove it " +
+          "to hide from T cells - NK cells kill exactly those cells ('missing self').",
+    color: [170, 110, 230], shape: "diamond",
+    hp: 34, dmg: 10, speed: 90, rng: 18, atk_cd: 0.7, role: "kill",
+  },
+  killer_t: {
+    simple: "Strike Cell", medical: "Cytotoxic T Cell (CD8+)", branch: "adaptive",
+    desc: "Kills infected cells - but only of strains the lymph node has learned, " +
+          "and it can't see cells hiding MHC-I.",
+    fact: "Each CD8+ T cell recognises one viral peptide shown on MHC-I and makes the " +
+          "infected cell self-destruct (apoptosis) before new virus escapes.",
+    color: [220, 70, 70], shape: "triangle",
+    hp: 30, dmg: 18, speed: 95, rng: 18, atk_cd: 0.7, role: "kill",
+  },
+  bcell: {
+    simple: "Antibody Cell", medical: "Plasma Cell (B cell)", branch: "adaptive",
+    desc: "Fires antibodies at free virus of learned strains. Tagged virus can't " +
+          "infect and is eaten 2x faster.",
+    fact: "One plasma cell releases thousands of antibodies per second. Antibodies " +
+          "block virus from entering cells (neutralization).",
+    color: [95, 145, 240], shape: "square",
+    hp: 22, dmg: 4, speed: 60, rng: 140, atk_cd: 0.9, role: "antibody",
+  },
+};
+
+const WORKER_DEF = {
+  simple: "Worker Cell", medical: "Fibroblast (tissue cell)",
+  color: [150, 230, 170], hp: 22, speed: 74,
+  fact: "Fibroblasts build and repair tissue with collagen. They don't fetch food - " +
+        "the blood brings it. Like most body cells they can be infected by viruses.",
+};
+
+const BUILDINGS = {
+  core: {
+    simple: "Core", medical: "Lymph Node", size: 3, hp: 500,
+    desc: "Where dendritic cells present antigen and T/B cells get activated. " +
+          "Complement proteins here destroy nearby free virus. If virus overwhelms " +
+          "it, you lose.",
+    fact: "Lymph nodes are meeting points where dendritic cells show antigen to T " +
+          "and B cells. Complement proteins in blood can destroy virus particles " +
+          "without any training.",
+    color: [120, 85, 190], cost: { atp: 0, bio: 0 }, work: 1,
+    housing: 10, produce: { atp: 0.6, bio: 0.6 },
+    zap: { dmg: 4, range: 140, cd: 0.5 },
+  },
+  // ---- colony ----
+  hub: {
+    simple: "Capillary", medical: "Capillary Bed", size: 1, hp: 80,
+    desc: "Must touch a blood vessel. Delivers glucose and amino acids from the " +
+          "blood - more for each vessel tile it touches.",
+    fact: "Capillaries are the tiniest blood vessels. Glucose, amino acids and " +
+          "oxygen - and immune cells - leave the blood through their thin walls.",
+    color: [200, 80, 90], cost: { atp: 25, bio: 25 }, work: 3,
+    supply: true,
+  },
+  arteriole: {
+    simple: "Flow Booster", medical: "Arteriole (vasodilation)", size: 2, hp: 110,
+    desc: "Widens to push more blood through nearby capillaries: +50% delivery " +
+          "from Capillary Beds in its range.",
+    fact: "Arterioles are small arteries that widen or narrow to control blood flow. " +
+          "During inflammation they widen - that's why infected skin goes red and warm.",
+    color: [225, 95, 110], cost: { atp: 60, bio: 30 }, work: 6,
+    boost: 170,
+  },
+  liver: {
+    simple: "Sugar Maker", medical: "Liver Lobule (gluconeogenesis)", size: 2,
+    hp: 110, desc: "Turns 0.6 amino acids/s into +1.5 glucose/s and sends it " +
+          "into the blood. Stops working if infected.",
+    fact: "When blood sugar is low, liver cells make new glucose from amino acids " +
+          "(gluconeogenesis) and release it into the blood for every cell to use.",
+    color: [235, 160, 60], cost: { atp: 20, bio: 45 }, work: 6,
+    produce: { atp: 1.5 }, consume: { bio: 0.6 },
+  },
+  house: {
+    simple: "Marrow Niche", medical: "Bone-Marrow Niche", size: 2, hp: 120,
+    desc: "+5 population cap (workers and immune cells both count).",
+    fact: "Bone-marrow stem cells make every type of blood cell, including all " +
+          "white blood cells. (T cells start here but finish maturing in the thymus.)",
+    color: [230, 120, 160], cost: { atp: 25, bio: 35 }, work: 5,
+    housing: 5,
+  },
+  barrier: {
+    simple: "Barrier Wall", medical: "Epithelial Barrier", size: 1, hp: 150,
+    desc: "Tightly joined cells. Virus must infect them to get through; your " +
+          "cells slip between. Hold & drag to paint.",
+    fact: "Epithelial cells lining the skin, airways and gut are joined by tight " +
+          "junctions - and are usually the first cells a virus infects.",
+    color: [215, 130, 165], cost: { atp: 0, bio: 6 }, work: 1.5,
+    wall: true,
+  },
+  // ---- innate ----
+  neu_nest: {
+    simple: "Swarm Nest", medical: "Marrow: Neutrophils", size: 2, hp: 100,
+    desc: "Spawns short-lived Neutrophils that eat free virus.",
+    fact: CELL_TYPES.neutrophil.fact,
+    color: CELL_TYPES.neutrophil.color, cost: { atp: 40, bio: 30 }, work: 5,
+    unit: "neutrophil", spawn_cd: 3.5, spawn_cost: { atp: 5, bio: 5 },
+  },
+  mac_nest: {
+    simple: "Eater Depot", medical: "Macrophage Depot", size: 2, hp: 130,
+    desc: "Spawns Macrophages that eat free virus.",
+    fact: CELL_TYPES.macrophage.fact,
+    color: CELL_TYPES.macrophage.color, cost: { atp: 60, bio: 40 }, work: 6,
+    unit: "macrophage", spawn_cd: 7.0, spawn_cost: { atp: 15, bio: 10 },
+  },
+  dc_niche: {
+    simple: "Scout Post", medical: "Dendritic Cell Niche", size: 2, hp: 90,
+    desc: "Keeps up to 3 Dendritic Cells on patrol. Without them, antigen only " +
+          "reaches the lymph node slowly.",
+    fact: CELL_TYPES.dendritic.fact,
+    color: CELL_TYPES.dendritic.color, cost: { atp: 45, bio: 35 }, work: 5,
+    unit: "dendritic", spawn_cd: 8.0, spawn_cost: { atp: 10, bio: 10 }, max: 3,
+  },
+  nk_den: {
+    simple: "Hunter Den", medical: "NK Cell Niche", size: 2, hp: 110,
+    desc: "Spawns NK cells that kill infected cells.",
+    fact: CELL_TYPES.nk.fact,
+    color: CELL_TYPES.nk.color, cost: { atp: 70, bio: 50 }, work: 7,
+    unit: "nk", spawn_cd: 7.0, spawn_cost: { atp: 16, bio: 12 },
+  },
+  // ---- adaptive ----
+  helper: {
+    simple: "Command Node", medical: "Helper T Cluster (CD4+)", size: 2, hp: 140,
+    desc: "Without Helper T cells adaptive activation takes twice as long. " +
+          "Aura: nearby depots spawn faster, immune cells +25% effect.",
+    fact: "Helper T cells kill nothing themselves - their cytokine signals activate " +
+          "CD8 T cells, B cells and macrophages. HIV destroys them.",
+    color: [255, 185, 70], cost: { atp: 90, bio: 70 }, work: 9,
+    aura: 190,
+  },
+  thymus: {
+    simple: "Strike Barracks", medical: "T-Cell Zone", size: 2, hp: 110,
+    desc: "Produces CD8 T cells - only once the lymph node has learned an active " +
+          "strain (clonal expansion).",
+    fact: CELL_TYPES.killer_t.fact,
+    color: CELL_TYPES.killer_t.color, cost: { atp: 80, bio: 60 }, work: 7,
+    unit: "killer_t", spawn_cd: 7.0, spawn_cost: { atp: 18, bio: 14 },
+    adaptive: true,
+  },
+  bcenter: {
+    simple: "Antibody Factory", medical: "Germinal Center", size: 2, hp: 100,
+    desc: "Produces plasma cells - only once the lymph node has learned an active " +
+          "strain.",
+    fact: "In germinal centers B cells mutate their antibody genes and the best " +
+          "binders are selected (affinity maturation).",
+    color: CELL_TYPES.bcell.color, cost: { atp: 70, bio: 55 }, work: 7,
+    unit: "bcell", spawn_cd: 7.0, spawn_cost: { atp: 16, bio: 14 },
+    adaptive: true,
+  },
+};
+
+const TABS = {
+  colony: ["hub", "arteriole", "liver", "house", "barrier"],
+  innate: ["neu_nest", "mac_nest", "dc_niche", "nk_den"],
+  adaptive: ["helper", "thymus", "bcenter"],
+};
+const TAB_ORDER = ["colony", "innate", "adaptive"];
+
+const TRAIT_TEXT = {
+  mhc_down: "Hides MHC-I: CD8 blind, NK strong",
+  ifn_block: "Blocks interferon signals",
+};
+
+const GROW_COST = { atp: 5, bio: 25 };
+
+// ------------------------------ HELPERS ---------------------------------
+const TAU = Math.PI * 2;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const darker = (c, f = 0.6) => [Math.floor(c[0] * f), Math.floor(c[1] * f), Math.floor(c[2] * f)];
+const lerpCol = (a, b, t) => [0, 1, 2].map(i => Math.floor(a[i] + (b[i] - a[i]) * t));
+const css = (c, a) => a === undefined ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const nm = (d, medical) => medical ? d.medical : d.simple;
+const sgn = v => (v > 0) - (v < 0);
+const fmtSigned = (v, n) => (v >= 0 ? "+" : "") + v.toFixed(n);
+
+function costStr(cost) {
+  const parts = [];
+  if (cost.atp) parts.push(`${cost.atp} ${RES_SHORT.atp}`);
+  if (cost.bio) parts.push(`${cost.bio} ${RES_SHORT.bio}`);
+  return parts.length ? parts.join(" + ") : "Free";
+}
+
+// Random helpers (Python random module equivalents)
+function makeRng(seed) {
+  let a = seed === undefined ? (Math.random() * 4294967296) >>> 0 : seed >>> 0;
+  const random = () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  return {
+    random,
+    uniform: (lo, hi) => lo + random() * (hi - lo),
+    randint: (lo, hi) => lo + Math.floor(random() * (hi - lo + 1)),
+    choice: arr => arr[Math.floor(random() * arr.length)],
+  };
+}
+const R = makeRng();
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(R.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+function sample(n, k) { return shuffle([...Array(n).keys()]).slice(0, k); }
+
+class Rect {
+  constructor(x, y, w, h) { this.x = x; this.y = y; this.w = w; this.h = h; }
+  get right() { return this.x + this.w; }
+  get bottom() { return this.y + this.h; }
+  get centerx() { return this.x + Math.floor(this.w / 2); }
+  get centery() { return this.y + Math.floor(this.h / 2); }
+  move(dx, dy) { return new Rect(this.x + dx, this.y + dy, this.w, this.h); }
+  inflate(dx, dy) { return new Rect(this.x - Math.floor(dx / 2), this.y - Math.floor(dy / 2), this.w + dx, this.h + dy); }
+  collidepoint(x, y) { return x >= this.x && x < this.right && y >= this.y && y < this.bottom; }
+  colliderect(o) { return this.x < o.right && o.x < this.right && this.y < o.bottom && o.y < this.bottom; }
+}
+const VIEW_RECT = new Rect(0, TOP_H, VIEW_W, VIEW_H);
+
+class MinHeap {
+  constructor() { this.a = []; }
+  get size() { return this.a.length; }
+  push(v) {
+    const a = this.a; a.push(v); let i = a.length - 1;
+    while (i > 0) { const p = (i - 1) >> 1; if (a[p][0] <= a[i][0]) break; [a[p], a[i]] = [a[i], a[p]]; i = p; }
+  }
+  pop() {
+    const a = this.a; const top = a[0]; const last = a.pop();
+    if (a.length) {
+      a[0] = last; let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1; let m = i;
+        if (l < a.length && a[l][0] < a[m][0]) m = l;
+        if (r < a.length && a[r][0] < a[m][0]) m = r;
+        if (m === i) break; [a[m], a[i]] = [a[i], a[m]]; i = m;
+      }
+    }
+    return top;
+  }
+}
+
+// ------------------------------ CANVAS ----------------------------------
+const canvas = document.getElementById("game");
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+canvas.width = WIDTH * DPR;
+canvas.height = HEIGHT * DPR;
+const ctx = canvas.getContext("2d");
+ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+const FAM = '"Atkinson Hyperlegible", "Segoe UI", Arial, sans-serif';
+const DISP = '"Chakra Petch", "Segoe UI", Arial, sans-serif';
+const mkFont = (size, bold, fam = FAM) => ({ css: `${bold ? 700 : 400} ${size}px ${fam}`, h: Math.round(size * 1.25), size });
+
+// Drawing primitives with pygame-like semantics (width 0 = filled).
+function pathRect(c, x, y, w, h, r) {
+  c.beginPath();
+  if (r > 0 && w > 0 && h > 0 && c.roundRect) c.roundRect(x, y, w, h, Math.min(r, w / 2, h / 2));
+  else c.rect(x, y, Math.max(0, w), Math.max(0, h));
+}
+function drawRect(c, color, r, width = 0, radius = 0) {
+  if (Array.isArray(r)) r = new Rect(...r);
+  if (width > 0) {
+    c.lineWidth = width; c.strokeStyle = typeof color === "string" ? color : css(color);
+    pathRect(c, r.x + width / 2, r.y + width / 2, r.w - width, r.h - width, Math.max(0, radius - width / 2));
+    c.stroke();
+  } else {
+    c.fillStyle = typeof color === "string" ? color : css(color);
+    pathRect(c, r.x, r.y, r.w, r.h, radius);
+    c.fill();
+  }
+}
+function drawCircle(c, color, p, r, width = 0) {
+  if (r <= 0) return;
+  c.beginPath();
+  if (width > 0) {
+    c.arc(p[0], p[1], Math.max(0.5, r - width / 2), 0, TAU);
+    c.lineWidth = width; c.strokeStyle = typeof color === "string" ? color : css(color); c.stroke();
+  } else {
+    c.arc(p[0], p[1], r, 0, TAU);
+    c.fillStyle = typeof color === "string" ? color : css(color); c.fill();
+  }
+}
+function drawPoly(c, color, pts, width = 0) {
+  c.beginPath(); c.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+  c.closePath();
+  if (width > 0) { c.lineWidth = width; c.strokeStyle = css(color); c.stroke(); }
+  else { c.fillStyle = css(color); c.fill(); }
+}
+function drawLine(c, color, a, b, width = 1) {
+  c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]);
+  c.lineWidth = width; c.strokeStyle = css(color); c.stroke();
+}
+function drawLines(c, color, pts, width = 1) {
+  c.beginPath(); c.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+  c.lineWidth = width; c.strokeStyle = css(color); c.stroke();
+}
+// pygame arc: angles counter-clockwise (y up) from the +x axis
+function drawArc(c, color, r, start, stop, width = 1) {
+  const rad = Math.min(r.w, r.h) / 2 - width / 2;
+  if (rad <= 0) return;
+  c.beginPath();
+  c.arc(r.x + r.w / 2, r.y + r.h / 2, rad, -start, -stop, true);
+  c.lineWidth = width; c.strokeStyle = css(color); c.stroke();
+}
+function drawEllipse(c, color, r, width = 0) {
+  c.beginPath();
+  c.ellipse(r.x + r.w / 2, r.y + r.h / 2, Math.max(0.5, r.w / 2 - width / 2), Math.max(0.5, r.h / 2 - width / 2), 0, 0, TAU);
+  if (width > 0) { c.lineWidth = width; c.strokeStyle = css(color); c.stroke(); }
+  else { c.fillStyle = css(color); c.fill(); }
+}
+
+function drawShape(c, shape, color, pos, r) {
+  const [x, y] = pos;
+  if (shape === "circle") drawCircle(c, color, [x, y], r);
+  else if (shape === "square") drawRect(c, color, new Rect(x - r, y - r, r * 2, r * 2), 0, 3);
+  else if (shape === "diamond") drawPoly(c, color, [[x, y - r], [x + r, y], [x, y + r], [x - r, y]]);
+  else if (shape === "triangle") drawPoly(c, color, [[x, y - r], [x + r, y + r], [x - r, y + r]]);
+  else if (shape === "star") {
+    const pts = [];
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? r : r * 0.45;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      pts.push([x + rad * Math.cos(a), y + rad * Math.sin(a)]);
+    }
+    drawPoly(c, color, pts);
+  }
+}
+
+function spiky(pos, r, spikes = 8, rot = 0) {
+  const [x, y] = pos; const pts = [];
+  for (let i = 0; i < spikes * 2; i++) {
+    const rad = i % 2 === 0 ? r : r * 0.55;
+    const ang = rot + i * Math.PI / spikes;
+    pts.push([x + rad * Math.cos(ang), y + rad * Math.sin(ang)]);
+  }
+  return pts;
+}
+
+/** Move an entity toward a point. Returns true once it has arrived. */
+function moveToward(ent, tx, ty, speed, dt, game) {
+  const dx = tx - ent.x, dy = ty - ent.y;
+  const d = Math.hypot(dx, dy);
+  const step = speed * game.tileSpeed(ent.x, ent.y) * dt;
+  if (d <= step || d < 1) { ent.x = tx; ent.y = ty; return true; }
+  ent.x += dx / d * step;
+  ent.y += dy / d * step;
+  return false;
+}
+
+// ------------------------------ ENTITIES --------------------------------
+let UID = 0;
+
+class Building {
+  constructor(key, gx, gy, built = false) {
+    this.uid = ++UID;
+    this.key = key;
+    this.d = BUILDINGS[key];
+    this.size = this.d.size;
+    this.gx = gx; this.gy = gy;
+    this.x = (gx + this.size / 2) * TILE;
+    this.y = (gy + this.size / 2) * TILE;
+    this.max_hp = this.d.hp;
+    this.built = built;
+    this.progress = 0;
+    this.hp = built ? this.max_hp : this.max_hp * 0.3;
+    this.timer = 0;
+    this.enabled = true;
+    this.rally = null;
+    this.builders = 0;
+    this.hit_flash = 0;
+    // infection state (the "building" is a cluster of host cells)
+    this.strain = null;
+    this.infection = 0;
+    this.next_burst = 25;
+    this.antiviral = 0;
+    this.vessels = 0;   // capillary beds: blood-vessel tiles touched
+  }
+  get rect() { return new Rect(this.gx * TILE, this.gy * TILE, this.size * TILE, this.size * TILE); }
+  tiles() {
+    const out = [];
+    for (let ty = this.gy; ty < this.gy + this.size; ty++)
+      for (let tx = this.gx; tx < this.gx + this.size; tx++) out.push([tx, ty]);
+    return out;
+  }
+  alive() { return this.hp > 0; }
+  takeDamage(a) { this.hp -= a; this.hit_flash = 0.15; }
+  addWork(amount, game) {
+    const work = this.d.work;
+    this.progress += amount;
+    this.hp = Math.min(this.max_hp, this.hp + this.max_hp * 0.7 * amount / work);
+    if (this.progress >= work && !this.built) { this.built = true; game.onBuilt(this); }
+  }
+  update(dt, game) {
+    this.hit_flash = Math.max(0, this.hit_flash - dt);
+    this.antiviral = Math.max(0, this.antiviral - dt);
+    if (this.strain) {
+      // the virus has hijacked these cells: no work, only virus production
+      const rate = this.strain.replication * (this.antiviral > 0 ? 0.4 : 1.0);
+      this.infection += rate * dt;
+      while (this.infection >= this.next_burst && this.next_burst < 100) {
+        this.next_burst += 25;
+        game.releaseVirions(this.x, this.y, this.strain, 2);
+      }
+      if (this.infection >= 100) this.hp = 0;
+      return;
+    }
+    if (!this.built || !this.enabled) return;
+    const d = this.d;
+    if (d.produce) {
+      const consume = d.consume || {};
+      const ok = Object.entries(consume).every(([r, amt]) => game.res[r] >= amt * dt);
+      if (ok) {
+        for (const [r, amt] of Object.entries(consume)) game.addRes(r, -amt * dt);
+        for (const [r, amt] of Object.entries(d.produce)) game.addRes(r, amt * dt);
+      }
+    }
+    if (d.supply) {
+      const m = game.supplyMult(this);
+      for (const [r, amt] of Object.entries(CAP_BASE)) game.addRes(r, amt * m * dt);
+    }
+    if (d.zap) {
+      const z = d.zap;
+      this.timer += dt;
+      if (this.timer >= z.cd) {
+        const v = game.nearestVirion([this.x, this.y], z.range);
+        if (v) {
+          this.timer = 0;
+          v.hit(z.dmg + game.zap_bonus, game);
+          game.fx.push({ kind: "shot", x: this.x, y: this.y, x2: v.x, y2: v.y, t: 0.15, life: 0.15, color: [200, 170, 255] });
+        }
+      }
+    }
+    if (d.unit) {
+      if (d.adaptive && game.active.size === 0) { this.timer = 0; return; }
+      if (d.max && game.units.filter(u => u.home === this).length >= d.max) { this.timer = 0; return; }
+      let cd = d.spawn_cd * (game.inAura(this.x, this.y) ? 0.7 : 1.0);
+      if (!d.adaptive) cd *= game.innate_cd_mult;
+      this.timer += dt;
+      if (this.timer >= cd) {
+        if (game.canAfford(d.spawn_cost) && game.pop() < game.pop_cap) {
+          game.spend(d.spawn_cost);
+          this.timer = 0;
+          game.spawnImmune(d.unit, this);
+        } else {
+          this.timer = cd;
+        }
+      }
+    }
+  }
+}
+
+/** A free virus particle. Can't attack - it drifts, attaches to a host cell and
+ *  infects it. Falls apart if it stays outside a cell too long. */
+class Virion {
+  constructor(strain, x, y) {
+    this.strain = strain;
+    this.max_hp = strain.hp;
+    this.hp = this.max_hp;
+    this.speed = strain.speed * R.uniform(0.85, 1.15);
+    this.color = strain.color;
+    this.x = x; this.y = y;
+    this.life = VIRION_LIFE;
+    this.neutralized = false;
+    this.rot = R.uniform(0, TAU);
+    this.wander = R.uniform(0, TAU);
+  }
+  alive() { return this.hp > 0 && this.life > 0; }
+  hit(dmg, game) {
+    if (this.hp <= 0) return;
+    if (this.neutralized) dmg *= 2;   // opsonization: antibody-coated virus is easy to eat
+    this.hp -= dmg;
+    if (this.hp <= 0) game.onVirionDestroyed(this);
+  }
+  consume() { this.hp = 0; }
+  update(dt, game) {
+    this.life -= dt * (this.neutralized ? 5 : 1);
+    this.rot += dt * 1.5;
+    this.wander += R.uniform(-2.5, 2.5) * dt;
+    this.x = clamp(this.x, 2, WORLD_W - 2);
+    this.y = clamp(this.y, 2, WORLD_H - 2);
+
+    if (this.neutralized) {
+      this.step(this.x + Math.cos(this.wander) * 30, this.y + Math.sin(this.wander) * 30,
+                this.speed * 0.4, dt, game, false);
+      return;
+    }
+    const host = game.nearestHost([this.x, this.y], 170);
+    if (host) {
+      if (host instanceof Worker) {
+        if (dist([this.x, this.y], [host.x, host.y]) <= 9) {
+          game.infect(host, this.strain);
+          this.consume();
+          return;
+        }
+      }
+      this.step(host.x, host.y, this.speed, dt, game);
+      return;
+    }
+    const gx = Math.floor(this.x / TILE), gy = Math.floor(this.y / TILE);
+    if (game.bgrid[gy][gx] === game.core) { game.virionReachesCore(this); return; }
+    const nxt = game.flowNext(gx, gy);
+    if (!nxt) return;
+    const tx = (nxt[0] + 0.5) * TILE + Math.cos(this.wander) * 8;
+    const ty = (nxt[1] + 0.5) * TILE + Math.sin(this.wander) * 8;
+    this.step(tx, ty, this.speed, dt, game);
+  }
+  step(tx, ty, spd, dt, game, infect = true) {
+    const ox = this.x, oy = this.y;
+    const cur = game.buildingAt(ox, oy);
+    moveToward(this, tx, ty, spd, dt, game);
+    const b = game.buildingAt(this.x, this.y);
+    if (b && b !== cur) {
+      this.x = ox; this.y = oy;
+      if (!infect) this.wander += Math.PI;
+      else if (b === game.core) game.virionReachesCore(this);
+      else { game.infect(b, this.strain); this.consume(); }
+    }
+  }
+}
+
+/** A friendly immune cell. */
+class Immune {
+  constructor(key, x, y, game, home) {
+    this.key = key;
+    const base = CELL_TYPES[key];
+    this.role = base.role;
+    this.max_hp = base.hp;
+    this.hp = this.max_hp;
+    this.dmg = base.dmg * game.dmg_mods[key];
+    this.speed = base.speed;
+    this.rng = base.rng;
+    this.atk_cd = base.atk_cd;
+    this.color = base.color;
+    this.shape = base.shape;
+    this.life = base.life ?? null;
+    this.x = x; this.y = y;
+    this.home = home;
+    this.post = game.postFor(home);
+    this.target = null;
+    this.move_target = null;
+    this.manual = false;
+    this.selected = false;
+    this.carrying = null;   // dendritic cell: antigen being carried
+    this.cd = 0;
+  }
+  alive() { return this.hp > 0; }
+  update(dt, game) {
+    this.cd = Math.max(0, this.cd - dt);
+    if (this.life !== null) {
+      this.life -= dt;
+      if (this.life <= 0) { this.hp = 0; return; }
+    }
+    if (this.carrying) {
+      const core = game.core;
+      if (dist([this.x, this.y], [core.x, core.y]) <= core.size * TILE / 2 + 12) {
+        game.presentAntigen(this.carrying, "dc");
+        this.carrying = null;
+      } else {
+        moveToward(this, core.x, core.y, this.speed, dt, game);
+      }
+      return;
+    }
+    if (this.manual) {
+      if (this.target && !game.targetAlive(this.target, this)) {
+        this.target = null;
+        if (!this.move_target) this.manual = false;
+      }
+      if (!this.target && this.move_target) {
+        if (moveToward(this, this.move_target[0], this.move_target[1], this.speed, dt, game)) {
+          this.post = this.move_target;
+          this.move_target = null;
+          this.manual = false;
+        }
+        return;
+      }
+    }
+    const enemy = (this.manual && this.target) ? this.target : this.findTarget(game);
+    if (enemy) {
+      const d = dist([this.x, this.y], [enemy.x, enemy.y]);
+      const reach = this.rng + (enemy instanceof Building ? enemy.size * TILE / 2 : 0);
+      if (d <= reach) { if (this.cd <= 0) this.act(enemy, game); }
+      else moveToward(this, enemy.x, enemy.y, this.speed, dt, game);
+      return;
+    }
+    if (dist([this.x, this.y], this.post) > 6)
+      moveToward(this, this.post[0], this.post[1], this.speed * 0.8, dt, game);
+  }
+  findTarget(game) {
+    const p = [this.x, this.y];
+    let t;
+    if (this.role === "eat") t = game.nearestVirion(p, 220, true);
+    else if (this.role === "antibody") t = game.nearestVirion(p, 240, false, true);
+    // chemokines released by infected tissue recruit killers from far away
+    else if (this.role === "kill") t = game.nearestInfected(p, 520, this.key === "killer_t");
+    else t = game.nearestNewAntigen(p, 240);
+    const leash = LEASH * (this.role === "kill" ? 1.6 : 1.0);
+    if (t && dist([t.x, t.y], this.post) > leash) return null;
+    return t;
+  }
+  act(t, game) {
+    const mult = game.auraMult(this.x, this.y);
+    this.cd = this.atk_cd;
+    if (this.role === "eat") {
+      t.hit(this.dmg * mult, game);
+      game.fx.push({ kind: "hit", x: t.x, y: t.y, t: 0.15, life: 0.15, color: WHITE });
+    } else if (this.role === "antibody") {
+      t.neutralized = true;
+      t.hit(this.dmg * mult, game);
+      this.cd = this.atk_cd * game.ab_cd_mult;
+      game.fx.push({ kind: "shot", x: this.x, y: this.y, x2: t.x, y2: t.y, t: 0.2, life: 0.2, color: IFN_COL });
+    } else if (this.role === "kill") {
+      let m = 1.0;
+      if (this.key === "nk") m = t.strain.traits.includes("mhc_down") ? 2.0 : 0.6;
+      game.killInfected(t, this.dmg * mult * m);
+    } else if (this.role === "present") {
+      if (t instanceof Virion) t.consume();
+      this.carrying = t.strain.antigen;
+      game.fx.push({ kind: "order", x: t.x, y: t.y, t: 0.4, life: 0.4, color: CYAN });
+    }
+  }
+}
+
+/** A colonist tissue cell (fibroblast). Picks its own jobs: build or repair.
+ *  It doesn't fetch food - the blood delivers nutrients through capillaries.
+ *  Can be infected - then it stops working and later bursts. */
+class Worker {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.max_hp = WORKER_DEF.hp;
+    this.hp = this.max_hp;
+    this.job = null;
+    this.home = null;   // where it rests when idle
+    this.think = R.uniform(0, 0.4);
+    this.selected = false;
+    this.strain = null;
+    this.eclipse = 0;
+    this.antiviral = 0;
+    this.size = 0;
+  }
+  alive() { return this.hp > 0; }
+  release() {
+    if (this.job) this.job[1].builders = Math.max(0, this.job[1].builders - 1);
+    this.job = null;
+  }
+  status(medical) {
+    if (this.strain) return `INFECTED - will burst in ${Math.max(0, Math.trunc(this.eclipse))}s`;
+    if (!this.job) return "Resting (fed by the blood)";
+    const [k, b] = this.job;
+    return (k === "build" ? "Building " : "Repairing ") + nm(b.d, medical);
+  }
+  update(dt, game) {
+    this.antiviral = Math.max(0, this.antiviral - dt);
+    if (this.strain) {
+      this.eclipse -= dt * (this.antiviral > 0 ? 0.5 : 1.0);
+      if (this.eclipse <= 0) game.workerBursts(this);
+      return;
+    }
+    const speed = WORKER_DEF.speed * game.work_mult;
+    if (!this.job) {
+      this.think -= dt;
+      if (this.think <= 0) { this.think = 0.4; game.assignJob(this); }
+      if (!this.job) {
+        if (!this.home) {
+          const ang = R.uniform(0, TAU), r = R.uniform(50, 80);
+          this.home = [game.core.x + Math.cos(ang) * r, game.core.y + Math.sin(ang) * r];
+        }
+        moveToward(this, this.home[0], this.home[1], speed * 0.5, dt, game);
+      }
+      return;
+    }
+    this.home = null;
+    const [kind, b] = this.job;
+    if (!b.alive() || !game.buildings.includes(b) || b.strain ||
+        (kind === "build" && b.built) || (kind === "repair" && b.hp >= b.max_hp)) {
+      this.release();
+      return;
+    }
+    if (dist([this.x, this.y], [b.x, b.y]) <= b.size * TILE / 2 + 10) {
+      if (kind === "build") b.addWork(dt * game.work_mult, game);
+      else b.hp = Math.min(b.max_hp, b.hp + 14 * dt * game.work_mult);
+    } else {
+      moveToward(this, b.x, b.y, speed, dt, game);
+    }
+  }
+}
+
+// --------------------------- HOW TO PLAY TEXT ---------------------------
+const HOWTO_PAGES = [
+  ["THE COLONY & THE VIRUS", [
+    ["YOUR COLONY", YELLOW, [
+      "The Core is a lymph node in a patch of tissue. Worker cells (fibroblasts) build your",
+      "blueprints and repair damage. They don't fetch food: the BLOOD delivers it.",
+      "Build Capillary Beds touching blood vessels (dark red) - each one supplies glucose and",
+      "amino acids. Arterioles widen to push more blood through nearby capillaries, and a",
+      "Liver Lobule turns spare amino acids into glucose. Every cell takes glucose from the",
+      "blood and makes its OWN ATP from it - if blood glucose runs out, cells starve.",
+    ]],
+    ["THE VIRUS - REAL LIFE CYCLE", RED, [
+      "Free virus can't attack. It drifts in from blood vessels (red markers show where the",
+      "next wave enters), attaches to one of your cells and INFECTS it.",
+      "An infected cell stops working, copies the virus, then BURSTS and releases new virus.",
+      "Virus outside a cell slowly falls apart. Barrier Walls make it infect them first.",
+      "Infected cells release INTERFERON: neighbours (blue outline) become hard to infect.",
+    ]],
+    ["HOW STRAINS EVOLVE", ORANGE, [
+      "Drift: a small change - your old antibodies don't fit as well, so protection is weaker.",
+      "Shift: genes swap with another flu strain (often from animals) - a brand-new strain.",
+      "Some strains also hide MHC-I or block interferon.",
+    ]],
+  ]],
+  ["YOUR IMMUNE SYSTEM", [
+    ["INNATE - fast, works on anything, no memory", CYAN, [
+      "Complement (at the lymph node), Neutrophils & Macrophages destroy FREE virus.",
+      "NK cells kill INFECTED cells - weak normally, very strong if the virus hides MHC-I.",
+      "Dendritic cells grab antigen and carry it to the lymph node.",
+    ]],
+    ["ADAPTIVE - slow the first time, specific, remembers", GREEN, [
+      "When antigen reaches the lymph node, T & B cells start activating (2x slower without",
+      "Helper T cells). Then: clonal expansion - CD8 T cells kill infected cells of THAT",
+      "strain, plasma cells fire antibodies that neutralize free virus of THAT strain.",
+      "After the wave most effector cells die (contraction) but MEMORY remains - the same",
+      "strain is recognised much faster next time. Vaccination gives memory early.",
+    ]],
+    ["GAME SIMPLIFICATIONS (be honest with your class!)", GREY, [
+      "Time is compressed: a primary response really takes ~1 week. Buildings stand for groups",
+      "of cells, and real immune cells patrol the whole body through blood and lymph.",
+      "The glucose bar is the blood's shared sugar supply - ATP itself is never shared.",
+      "Many real viruses bud out of cells instead of bursting them. Plasma cells really stay",
+      "in lymph nodes or marrow and their antibodies travel in the blood. Complement is",
+      "spread through blood and tissue, not only at the lymph node.",
+    ]],
+  ]],
+];
+
+// -------------------------------- INPUT ---------------------------------
+const input = { mouse: [0, 0], keys: new Set() };
+
+// --------------------------------- GAME ---------------------------------
+class Game {
+  constructor() {
+    this.f_small = mkFont(14);
+    this.f = mkFont(17);
+    this.f_bold = mkFont(17, true);
+    this.f_med = mkFont(22, true);
+    this.f_big = mkFont(40, true, DISP);
+    this.f_title = mkFont(74, true, DISP);
+
+    this.medical = false;
+    this.difficulty = "Normal";
+    this.state = "MENU";
+    this.prev_state = "MENU";
+    this.has_game = false;
+    this.click_targets = [];
+    this.time = 0;
+    this.howto_page = 0;
+    this.menu_blobs = [];
+    for (let i = 0; i < 46; i++) this.menu_blobs.push(this.newBlob(R.uniform(0, WIDTH)));
+
+    this.map = document.createElement("canvas");
+    this.map.width = WORLD_W * DPR;
+    this.map.height = WORLD_H * DPR;
+    this.mctx = this.map.getContext("2d");
+    this.mctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+
+  // =============================== helpers ================================
+  name(d) { return nm(d, this.medical); }
+
+  text(s, font, color, x, y, align) {
+    ctx.font = font.css;
+    ctx.textBaseline = "top";
+    const w = ctx.measureText(s).width;
+    if (align === "c") x -= Math.floor(w / 2);
+    else if (align === "r") x -= w;
+    ctx.fillStyle = css(color);
+    ctx.fillText(s, x, y);
+    return w;
+  }
+  measure(s, font) { ctx.font = font.css; return ctx.measureText(s).width; }
+
+  wrap(s, font, maxW) {
+    const words = s.split(" "), lines = [];
+    let cur = "";
+    for (const w of words) {
+      const test = (cur + " " + w).trim();
+      if (this.measure(test, font) <= maxW) cur = test;
+      else { if (cur) lines.push(cur); cur = w; }
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+
+  button(rect, label, action, style = "normal", enabled = true, font = null) {
+    if (Array.isArray(rect)) rect = new Rect(...rect);
+    const hover = rect.collidepoint(...input.mouse) && enabled;
+    let base = { normal: PANEL_LIGHT, primary: [54, 120, 84], danger: [130, 50, 56], on: [60, 104, 140] }[style];
+    if (hover) base = base.map(c => Math.min(255, c + 22));
+    if (!enabled) base = [36, 33, 40];
+    drawRect(ctx, base, rect, 0, 8);
+    drawRect(ctx, hover ? WHITE : PANEL_EDGE, rect, 2, 8);
+    font = font || this.f_bold;
+    const w = this.measure(label, font);
+    this.text(label, font, enabled ? WHITE : GREY, rect.centerx - Math.floor(w / 2),
+              rect.centery - Math.floor(font.h / 2));
+    if (enabled) this.click_targets.push([rect, action]);
+  }
+
+  /** Show a message. With a key, the same kind of message is throttled. */
+  alert(msg, color = WHITE, key = null, cooldown = 0) {
+    if (key) {
+      if ((this.alert_cd[key] || 0) > 0) return;
+      this.alert_cd[key] = cooldown;
+    }
+    this.alerts.push([msg, color, 6.0]);
+    this.alerts = this.alerts.slice(-6);
+  }
+
+  w2s(x, y) { return [Math.trunc(x - this.cam_x), Math.trunc(y - this.cam_y + TOP_H)]; }
+  s2w(sx, sy) { return [sx + this.cam_x, sy - TOP_H + this.cam_y]; }
+
+  tileSpeed(x, y) {
+    const gx = Math.floor(x / TILE), gy = Math.floor(y / TILE);
+    if (gx >= 0 && gx < MAP_W && gy >= 0 && gy < MAP_H && this.tiles[gy][gx] === T_VESSEL) return 1.4;
+    return 1.0;
+  }
+  buildingAt(x, y) {
+    const gx = Math.floor(x / TILE), gy = Math.floor(y / TILE);
+    if (gx >= 0 && gx < MAP_W && gy >= 0 && gy < MAP_H) return this.bgrid[gy][gx];
+    return null;
+  }
+  pop() { return this.workers.length + this.units.length; }
+  canAfford(cost) { return this.res.atp >= (cost.atp || 0) && this.res.bio >= (cost.bio || 0); }
+  spend(cost) { this.res.atp -= cost.atp || 0; this.res.bio -= cost.bio || 0; }
+  addRes(r, amt) { this.res[r] += amt; this.rate_acc[r] += amt; }
+
+  // ---- searches ----
+  nearestVirion(pos, maxRange, preferTagged = false, antibody = false) {
+    let best = null, bd = maxRange;
+    for (const v of this.virions) {
+      if (!v.alive()) continue;
+      if (antibody && (v.neutralized || !this.active.has(v.strain.antigen))) continue;
+      let d = dist(pos, [v.x, v.y]);
+      if (preferTagged && v.neutralized) d *= 0.6;
+      if (d < bd) { best = v; bd = d; }
+    }
+    return best;
+  }
+  infectedCells() {
+    const out = [];
+    for (const w of this.workers) if (w.strain) out.push(w);
+    for (const b of this.buildings) if (b.strain) out.push(b);
+    return out;
+  }
+  nearestInfected(pos, maxRange, cd8 = false) {
+    let best = null, bd = maxRange;
+    for (const c of this.infectedCells()) {
+      if (cd8 && (!this.active.has(c.strain.antigen) || c.strain.traits.includes("mhc_down"))) continue;
+      const d = dist(pos, [c.x, c.y]);
+      if (d < bd) { best = c; bd = d; }
+    }
+    return best;
+  }
+  /** For dendritic cells: virus or infected cells whose antigen the lymph node
+   *  isn't already responding to. */
+  nearestNewAntigen(pos, maxRange) {
+    let best = null, bd = maxRange;
+    for (const t of [...this.virions, ...this.infectedCells()]) {
+      if (t instanceof Virion && (!t.alive() || t.neutralized)) continue;
+      const st = this.antigens.get(t.strain.antigen);
+      if (st && (st.state === "learning" || st.state === "active")) continue;
+      if (this.units.some(u => u.carrying === t.strain.antigen)) continue;
+      const d = dist(pos, [t.x, t.y]);
+      if (d < bd) { best = t; bd = d; }
+    }
+    return best;
+  }
+  /** Healthy host cells a free virus can attach to (not the lymph node). */
+  nearestHost(pos, maxRange) {
+    let best = null, bd = maxRange;
+    for (const w of this.workers) {
+      if (!w.strain) { const d = dist(pos, [w.x, w.y]); if (d < bd) { best = w; bd = d; } }
+    }
+    for (const b of this.buildings) {
+      if (b === this.core || b.strain) continue;
+      const d = dist(pos, [b.x, b.y]) - b.size * TILE / 2;
+      if (d < bd) { best = b; bd = d; }
+    }
+    return best;
+  }
+  targetAlive(t, unit) {
+    if (t instanceof Virion) return t.alive() && (unit.role === "eat" || unit.role === "antibody");
+    if (t instanceof Worker) return t.alive() && !!t.strain && unit.role === "kill";
+    return this.buildings.includes(t) && !!t.strain && unit.role === "kill";
+  }
+
+  // ---- blood supply ----
+  /** Blood-vessel tiles in the ring of tiles around a footprint. */
+  vesselsTouching(gx, gy, size) {
+    let n = 0;
+    for (let ty = gy - 1; ty < gy + size + 1; ty++) {
+      for (let tx = gx - 1; tx < gx + size + 1; tx++) {
+        if (tx >= gx && tx < gx + size && ty >= gy && ty < gy + size) continue;
+        if (tx >= 0 && tx < MAP_W && ty >= 0 && ty < MAP_H && this.tiles[ty][tx] === T_VESSEL) n++;
+      }
+    }
+    return n;
+  }
+  boosted(b) {
+    return this.buildings.some(a => a.key === "arteriole" && a.built && !a.strain &&
+                                    dist([a.x, a.y], [b.x, b.y]) <= a.d.boost);
+  }
+  supplyMult(b) {
+    let m = 0.6 + CAP_PER_VESSEL * Math.min(b.vessels, CAP_MAX_VESSELS);
+    if (this.boosted(b)) m *= 1 + ARTERIOLE_BOOST;
+    return m;
+  }
+
+  inAura(x, y) {
+    return this.buildings.some(b => b.built && !b.strain && b.d.aura && dist([x, y], [b.x, b.y]) <= b.d.aura);
+  }
+  auraMult(x, y) { return this.inAura(x, y) ? 1.25 : 1.0; }
+
+  postFor(home) {
+    const [bx, by] = home.rally ? home.rally : [home.x, home.y];
+    const ang = R.uniform(0, TAU);
+    const r = home.rally ? R.uniform(10, 40) : R.uniform(home.size * TILE * 0.7, 60);
+    return [clamp(bx + Math.cos(ang) * r, 8, WORLD_W - 8), clamp(by + Math.sin(ang) * r, 8, WORLD_H - 8)];
+  }
+
+  // ============================== new game ================================
+  newGame() {
+    this.diff = DIFFICULTY[this.difficulty];
+    const start = this.diff.start;
+    this.res = { atp: start, bio: start };
+    this.rate = { atp: 0, bio: 0 };
+    this.rate_acc = { atp: 0, bio: 0 };
+    this.rate_t = 0;
+    this.ap = 0;
+    this.wave = 0;
+    this.wave_active = false;
+    this.countdown = FIRST_WAVE_DELAY;
+    this.spawn_queue = [];
+    this.spawn_t = 0;
+    this.active_entries = [];
+
+    this.buildings = []; this.workers = []; this.units = []; this.virions = [];
+    this.fx = []; this.alerts = [];
+    this.alert_cd = {};
+    this.dmg_mods = {}; for (const k in CELL_TYPES) this.dmg_mods[k] = 1.0;
+    this.work_mult = 1.0;
+    this.innate_cd_mult = 1.0;
+    this.ab_cd_mult = 1.0;
+    this.ifn_mult = 1.0;
+    this.ifn_protect = 0.7;
+    this.zap_bonus = 0;
+    this.upgrade_options = [];
+    this.fact = R.choice(FACTS);
+    this.starving = false;
+    this.stats = { killed: 0, infections: 0, lost_workers: 0, apoptosis: 0, built: 0, time: 0 };
+
+    // adaptive immunity: antigen -> {state: learning/active/memory, t, total}
+    this.antigens = new Map();
+    this.active = new Set();
+    this.family = null;
+    this.variant = 0;
+    this.cur_strain = null;
+    this.contraction_note = "";
+
+    this.generateMap();
+    this.bgrid = [];
+    for (let y = 0; y < MAP_H; y++) this.bgrid.push(new Array(MAP_W).fill(null));
+    this.core = new Building("core", this.core_gx, this.core_gy, true);
+    this.placeBuilding(this.core);
+    this.recomputePopCap();
+
+    for (let i = 0; i < 4; i++) {
+      const ang = R.uniform(0, TAU);
+      this.workers.push(new Worker(this.core.x + Math.cos(ang) * 60, this.core.y + Math.sin(ang) * 60));
+    }
+    this.worker_target = 5;
+    this.auto_grow = true;
+    this.grow_t = 0;
+
+    this.cam_x = clamp(this.core.x - VIEW_W / 2, 0, WORLD_W - VIEW_W);
+    this.cam_y = clamp(this.core.y - VIEW_H / 2, 0, WORLD_H - VIEW_H);
+    this.speed = 1;
+    this.paused = false;
+    this.tab = "colony";
+    this.build_key = null;
+    this.sel_building = null;
+    this.sel_worker = null;
+    this.drag_start = null;
+    this.drag_rect = null;
+    this.painting = false;
+    this.pan_drag = null;
+    this.mm_drag = false;
+
+    this.planNextWave();
+    this.has_game = true;
+    this.state = "PLAYING";
+    this.alert("Welcome! The blood feeds your colony - build Capillary Beds touching blood vessels.", WHITE);
+    this.alert("Build innate defenses and Scout Posts before the virus arrives.", ORANGE);
+  }
+
+  generateMap() {
+    const rng = makeRng();
+    this.tiles = [];
+    this.noise = [];
+    for (let y = 0; y < MAP_H; y++) {
+      this.tiles.push(new Array(MAP_W).fill(T_TISSUE));
+      this.noise.push(Array.from({ length: MAP_W }, () => rng.random()));
+    }
+    this.core_gx = Math.floor(MAP_W / 2) - 1;
+    this.core_gy = Math.floor(MAP_H / 2) - 1;
+    const ccx = this.core_gx + 1, ccy = this.core_gy + 1;
+
+    const cand = [
+      ["North", rng.randint(12, MAP_W - 12), 0],
+      ["South", rng.randint(12, MAP_W - 12), MAP_H - 1],
+      ["West", 0, rng.randint(10, MAP_H - 10)],
+      ["East", MAP_W - 1, rng.randint(10, MAP_H - 10)],
+      ["North-East", MAP_W - 1, rng.randint(2, 6)],
+      ["South-West", 0, rng.randint(MAP_H - 7, MAP_H - 3)],
+    ];
+    this.entries = [];
+    for (const [name, ex, ey] of cand) {
+      this.entries.push({ name, x: (ex + 0.5) * TILE, y: (ey + 0.5) * TILE });
+      let x = ex, y = ey, steps = 0;
+      while (Math.hypot(x - ccx, y - ccy) > 7 && steps < 400) {
+        steps++;
+        for (const [ox, oy] of [[0, 0], [1, 0], [0, 1]]) {
+          const tx = x + ox, ty = y + oy;
+          if (tx >= 0 && tx < MAP_W && ty >= 0 && ty < MAP_H) this.tiles[ty][tx] = T_VESSEL;
+        }
+        const dx = ccx - x, dy = ccy - y;
+        const horizontal = Math.abs(dx) > Math.abs(dy);
+        if (rng.random() < 0.65) {
+          if (horizontal) x += sgn(dx); else y += sgn(dy);
+        } else {
+          if (horizontal) y += rng.choice([-1, 1]); else x += rng.choice([-1, 1]);
+        }
+        x = clamp(x, 0, MAP_W - 1); y = clamp(y, 0, MAP_H - 1);
+      }
+    }
+
+    // The lymph node has its own small blood supply: a short broken vessel
+    // ring a few tiles out, so early Capillary Beds can be built close to home.
+    for (let i = 0; i < 48; i++) {
+      const a = i / 48 * TAU;
+      const tx = Math.round(ccx + Math.cos(a) * 5), ty = Math.round(ccy + Math.sin(a) * 4);
+      if (i % 12 < 4 && tx >= 0 && tx < MAP_W && ty >= 0 && ty < MAP_H) this.tiles[ty][tx] = T_VESSEL;
+    }
+
+    for (let ty = this.core_gy - 1; ty < this.core_gy + 4; ty++)
+      for (let tx = this.core_gx - 1; tx < this.core_gx + 4; tx++) this.tiles[ty][tx] = T_TISSUE;
+
+    for (let gy = 0; gy < MAP_H; gy++) for (let gx = 0; gx < MAP_W; gx++) this.renderTile(gx, gy);
+  }
+
+  renderTile(gx, gy) {
+    const c = this.mctx;
+    const x = gx * TILE, y = gy * TILE;
+    const n = this.noise[gy][gx];
+    const t = this.tiles[gy][gx];
+    drawRect(c, lerpCol([40, 24, 32], [52, 31, 41], n), new Rect(x, y, TILE, TILE));
+    const rng = makeRng(gx * 7919 + gy * 104729);
+    if (t === T_VESSEL) {
+      drawRect(c, lerpCol([92, 22, 32], [104, 26, 36], n), new Rect(x, y, TILE, TILE));
+      for (let i = 0; i < 2; i++)
+        drawCircle(c, [140, 40, 50], [x + rng.randint(5, TILE - 5), y + rng.randint(5, TILE - 5)], rng.randint(2, 4));
+    } else if (n > 0.82) {
+      drawCircle(c, [60, 38, 50], [x + rng.randint(6, 26), y + rng.randint(6, 26)], rng.randint(2, 5), 1);
+    }
+  }
+
+  // ============================ map systems ==============================
+  placeBuilding(b) {
+    b.vessels = this.vesselsTouching(b.gx, b.gy, b.size);
+    this.buildings.push(b);
+    for (const [tx, ty] of b.tiles()) this.bgrid[ty][tx] = b;
+    this.rebuildFlow();
+  }
+  removeBuilding(b) {
+    const i = this.buildings.indexOf(b);
+    if (i >= 0) this.buildings.splice(i, 1);
+    for (const [tx, ty] of b.tiles()) if (this.bgrid[ty][tx] === b) this.bgrid[ty][tx] = null;
+    if (this.sel_building === b) this.sel_building = null;
+    for (const u of this.units) if (u.home === b) u.home = this.core;
+    this.rebuildFlow();
+    this.recomputePopCap();
+  }
+
+  /** Dijkstra flow field toward the lymph node: the path lymph/blood flow carries
+   *  drifting virus along. Buildings are costly to pass. */
+  rebuildFlow() {
+    const INF = Infinity;
+    const fd = [];
+    for (let y = 0; y < MAP_H; y++) fd.push(new Array(MAP_W).fill(INF));
+    const heap = new MinHeap();
+    for (const [tx, ty] of this.core.tiles()) { fd[ty][tx] = 0; heap.push([0, tx, ty]); }
+    const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    while (heap.size) {
+      const [d, x, y] = heap.pop();
+      if (d > fd[y][x]) continue;
+      for (const [dx, dy] of DIRS) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) continue;
+        if (dx && dy && (this.bgrid[y][nx] || this.bgrid[ny][x])) continue;
+        const b = this.bgrid[ny][nx];
+        if (b === this.core) continue;
+        const c = b ? 10.0 : (this.tiles[ny][nx] === T_VESSEL ? 0.7 : 1.0);
+        const nd = d + c * (dx && dy ? 1.414 : 1.0);
+        if (nd < fd[ny][nx]) { fd[ny][nx] = nd; heap.push([nd, nx, ny]); }
+      }
+    }
+    this.flow = fd;
+  }
+  flowNext(gx, gy) {
+    let best = null, bd = this.flow[gy][gx];
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const nx = gx + dx, ny = gy + dy;
+      if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) continue;
+      if (dx && dy && (this.bgrid[gy][nx] || this.bgrid[ny][gx])) continue;
+      if (this.flow[ny][nx] < bd) { best = [nx, ny]; bd = this.flow[ny][nx]; }
+    }
+    return best;
+  }
+  recomputePopCap() {
+    this.pop_cap = this.buildings.filter(b => b.built).reduce((s, b) => s + (b.d.housing || 0), 0);
+  }
+
+  // ============================== colony =================================
+  threatNear(pos, r) {
+    return this.virions.some(v => !v.neutralized && Math.abs(v.x - pos[0]) < r && Math.abs(v.y - pos[1]) < r);
+  }
+  assignJob(w) {
+    const pos = [w.x, w.y];
+    let best = null, bd = 1e9;
+    for (const b of this.buildings) {
+      if (!b.built && b.builders < 2 && !b.strain) {
+        const d = dist(pos, [b.x, b.y]);
+        if (d < bd && !this.threatNear([b.x, b.y], 140)) { best = b; bd = d; }
+      }
+    }
+    if (best) { w.job = ["build", best]; best.builders++; return; }
+    for (const b of this.buildings) {
+      if (b.built && !b.strain && b.hp < b.max_hp * 0.8 && b.builders < 1) {
+        const d = dist(pos, [b.x, b.y]);
+        if (d < bd && !this.threatNear([b.x, b.y], 140)) { best = b; bd = d; }
+      }
+    }
+    if (best) { w.job = ["repair", best]; best.builders++; }
+  }
+  growWorker(silent = false) {
+    if (this.pop() >= this.pop_cap) {
+      if (!silent) this.alert("Population cap reached - build a Marrow Niche.", ORANGE);
+      return;
+    }
+    if (!this.canAfford(GROW_COST)) {
+      if (!silent) this.alert(`Growing a worker costs ${costStr(GROW_COST)}.`, ORANGE);
+      return;
+    }
+    this.spend(GROW_COST);
+    const ang = R.uniform(0, TAU);
+    this.workers.push(new Worker(this.core.x + Math.cos(ang) * 52, this.core.y + Math.sin(ang) * 52));
+  }
+  spawnImmune(key, home) {
+    this.units.push(new Immune(key, home.x + R.uniform(-10, 10), home.y + R.uniform(-10, 10), this, home));
+  }
+  onBuilt(b) { this.stats.built++; this.recomputePopCap(); }
+  destroyBuilding(b) {
+    this.removeBuilding(b);
+    if (b === this.core) { this.state = "GAMEOVER"; return; }
+    this.fx.push({ kind: "pop", x: b.x, y: b.y, t: 0.6, life: 0.6, color: ORANGE });
+  }
+  demolish(b) {
+    if (b === this.core) return;
+    if (b.strain) {
+      this.alert("You can't demolish infected tissue - send NK / CD8 T cells to it.", ORANGE);
+      return;
+    }
+    const refund = b.built ? 0.5 : 1.0;
+    for (const r of ["atp", "bio"]) this.res[r] += (b.d.cost[r] || 0) * refund;
+    this.destroyBuilding(b);
+  }
+
+  // ============================ infection ================================
+  releaseVirions(x, y, strain, n) {
+    for (let i = 0; i < n; i++)
+      this.virions.push(new Virion(strain, x + R.uniform(-12, 12), y + R.uniform(-12, 12)));
+  }
+  infect(host, strain) {
+    if (host.strain) {
+      if (host instanceof Building) host.infection += 6;
+      return;
+    }
+    if (host.antiviral > 0 && R.random() < this.ifn_protect) {
+      this.fx.push({ kind: "text", x: host.x, y: host.y - 12, t: 0.8, life: 0.8, text: "blocked", color: IFN_COL });
+      return;
+    }
+    host.strain = strain;
+    this.stats.infections++;
+    if (host instanceof Worker) {
+      host.release();
+      host.eclipse = strain.eclipse;
+      this.alert("A tissue cell was infected - kill it with NK / CD8 cells before it bursts!",
+                 INFECT, "inf_w", 10);
+    } else {
+      host.infection = 5;
+      host.next_burst = 25;
+      this.alert(`${this.name(host.d)} infected! It stopped working and is making virus.`, INFECT, "inf_b", 6);
+    }
+    if (!strain.traits.includes("ifn_block")) this.emitIfn(host.x, host.y);
+  }
+  emitIfn(x, y) {
+    const r = IFN_RADIUS * this.ifn_mult;
+    for (const w of this.workers) if (dist([x, y], [w.x, w.y]) <= r) w.antiviral = IFN_TIME;
+    for (const b of this.buildings) if (b !== this.core && dist([x, y], [b.x, b.y]) <= r) b.antiviral = IFN_TIME;
+    this.fx.push({ kind: "ifn", x, y, r, t: 0.8, life: 0.8, color: IFN_COL });
+  }
+  workerBursts(w) {
+    this.releaseVirions(w.x, w.y, w.strain, w.strain.burst);
+    this.stats.lost_workers++;
+    w.hp = 0;
+    this.fx.push({ kind: "pop", x: w.x, y: w.y, t: 0.6, life: 0.6, color: INFECT });
+    this.alert(`An infected cell burst, releasing ${w.strain.burst} new virus particles!`, RED, "burst", 8);
+  }
+  killInfected(t, dmg) {
+    if (t instanceof Worker) {
+      t.hp -= dmg;
+      if (t.hp <= 0) {
+        // apoptosis: the cell dies before the new virus is finished
+        t.strain = null;
+        this.stats.apoptosis++;
+        this.ap += 1;
+        this.fx.push({ kind: "pop", x: t.x, y: t.y, t: 0.5, life: 0.5, color: GREEN });
+      }
+      return;
+    }
+    t.infection -= dmg * 2.5;
+    t.takeDamage(dmg * 0.3);   // killing infected tissue costs healthy tissue too
+    if (t.infection <= 0) {
+      t.strain = null;
+      t.infection = 0;
+      t.next_burst = 25;
+      this.ap += 1;
+      this.fx.push({ kind: "pop", x: t.x, y: t.y, t: 0.6, life: 0.6, color: GREEN });
+      this.alert("Infected cells destroyed (some healthy tissue lost - collateral damage).", GREEN, "cleared", 6);
+    }
+  }
+  virionReachesCore(v) {
+    v.consume();
+    this.core.takeDamage(v.strain.core_dmg);
+    this.presentAntigen(v.strain.antigen, "lymph");
+  }
+  onVirionDestroyed(v) {
+    this.stats.killed++;
+    this.ap += 0.25;
+    this.fx.push({ kind: "pop", x: v.x, y: v.y, t: 0.35, life: 0.35, color: v.color });
+  }
+
+  // ========================= adaptive immunity ===========================
+  helpFactor() {
+    const helpers = this.buildings.filter(b => b.key === "helper" && b.built && !b.strain).length;
+    if (helpers === 0) return 2.0;
+    return Math.max(0.5, 1.0 - 0.2 * (helpers - 1));
+  }
+  presentAntigen(ag, source) {
+    const st = this.antigens.get(ag);
+    if (!st) {
+      let t = ACTIVATION_TIME * this.helpFactor();
+      const fam = ag.split(".")[0];
+      let cross = false;
+      for (const [k, v] of this.antigens)
+        if (k.split(".")[0] === fam && (v.state === "memory" || v.state === "active")) cross = true;
+      if (cross) t *= 0.5;
+      this.antigens.set(ag, { state: "learning", t, total: t });
+      const who = source === "dc" ? "A dendritic cell" : "Lymph flow";
+      const extra = cross ? " (cross-reactive memory helps)" : "";
+      this.alert(`${who} brought Strain ${ag} to the lymph node. T & B cells activating ` +
+                 `(~${Math.trunc(t)}s)${extra}.`, CYAN);
+    } else if (st.state === "memory") {
+      st.state = "active";
+      this.active.add(ag);
+      this.alert(`Memory cells recognise Strain ${ag}! Fast secondary response.`, GREEN);
+      this.clonalExpansion(ag);
+    }
+  }
+  updateAdaptive(dt) {
+    for (const [ag, st] of this.antigens) {
+      if (st.state === "learning") {
+        st.t -= dt;
+        if (st.t <= 0) {
+          st.state = "active";
+          this.active.add(ag);
+          this.alert(`Adaptive response ACTIVE vs Strain ${ag}: CD8 T cells and antibodies now target it.`, GREEN);
+          this.clonalExpansion(ag);
+        }
+      }
+    }
+  }
+  clonalExpansion(ag) {
+    let n = 0;
+    for (const [key, count] of [["killer_t", 3], ["bcell", 2]]) {
+      for (let i = 0; i < count; i++) {
+        if (this.pop() < this.pop_cap) { this.spawnImmune(key, this.core); n++; }
+      }
+    }
+    if (n) this.fx.push({ kind: "pop", x: this.core.x, y: this.core.y, t: 0.8, life: 0.8, color: GREEN });
+  }
+
+  // =============================== waves =================================
+  planNextWave() {
+    const k = Math.min(1 + Math.floor(this.wave / 3), 4);
+    this.next_entries = sample(this.entries.length, k);
+    const w = this.wave + 1;
+    let change = null;
+    if (this.family === null) {
+      this.family = "A"; this.variant = 1; change = "new";
+    } else if (w >= 7 && R.random() < 0.18 && this.family !== "D") {
+      this.family = String.fromCharCode(this.family.charCodeAt(0) + 1);
+      this.variant = 1; change = "shift";
+    } else if (w >= 3 && R.random() < 0.4) {
+      this.variant++; change = "drift";
+    }
+    const ag = this.variant === 1 ? this.family : `${this.family}.${this.variant}`;
+    const traits = [];
+    if (w >= 3 && R.random() < 0.3 + 0.04 * w) traits.push("mhc_down");
+    if (w >= 5 && R.random() < 0.25 + 0.04 * w) traits.push("ifn_block");
+    const hm = this.diff.hp_mult;
+    this.next_strain = {
+      antigen: ag, change, traits,
+      hp: (10 + w * 2.5) * hm, speed: 36 + w * 1.3,
+      eclipse: Math.max(5.0, 11.0 - w * 0.4), burst: 2 + Math.floor(w / 5),
+      replication: 6 + w * 0.6, core_dmg: 4 + w * 0.7,
+      color: FAMILY_COLORS[this.family],
+    };
+  }
+  startWave() {
+    this.wave++;
+    this.wave_active = true;
+    this.cur_strain = this.next_strain;
+    this.active_entries = [...this.next_entries];
+    const n = Math.trunc((6 + this.wave * 2.5) * this.diff.wave_mult);
+    this.spawn_queue = [];
+    for (let i = 0; i < n; i++) this.spawn_queue.push(this.active_entries[i % this.active_entries.length]);
+    this.spawn_t = 0;
+    const names = this.active_entries.map(i => this.entries[i].name).join(", ");
+    const ag = this.cur_strain.antigen;
+    this.alert(`WAVE ${this.wave}: Strain ${ag} (${n} particles) entering from ${names}!`, RED);
+    const ch = this.cur_strain.change;
+    if (ch === "drift") this.alert("Antigenic DRIFT: the virus changed slightly - old antibodies fit less well.", ORANGE);
+    else if (ch === "shift") this.alert("Antigenic SHIFT: a brand-new strain your immune system has never seen!", ORANGE);
+    const st = this.antigens.get(ag);
+    if (st && st.state === "memory") this.presentAntigen(ag, "memory");
+  }
+  callWaveEarly() {
+    if (this.wave_active) return;
+    const bonus = Math.floor(this.countdown / 10);
+    this.ap += bonus;
+    this.countdown = 0;
+    if (bonus) this.alert(`Called early: +${bonus} Adaptation Points.`, CYAN);
+  }
+  waveCleared() {
+    this.wave_active = false;
+    this.active_entries = [];
+    this.ap += 5 + this.wave;
+    // contraction: most effector cells die, memory remains
+    for (const ag of this.active) this.antigens.get(ag).state = "memory";
+    this.active = new Set();
+    for (const st of this.antigens.values()) if (st.state === "learning") st.state = "memory";
+    const eff = this.units.filter(u => u.key === "killer_t" || u.key === "bcell");
+    let removed = 0;
+    eff.forEach((u, i) => { if (i % 3 !== 0) { u.hp = 0; removed++; } });
+    this.units = this.units.filter(u => u.alive());
+    this.contraction_note = removed
+      ? `Contraction: ${removed} effector T/B cells died off now the infection is gone. Memory cells remain.`
+      : "";
+    if (this.wave >= WIN_WAVE) { this.state = "VICTORY"; return; }
+    this.countdown = Math.max(40, 70 - this.wave * 2);
+    this.planNextWave();
+    this.buildUpgradeOptions();
+    this.fact = R.choice(FACTS);
+    this.state = "ADAPT";
+  }
+  updateWaves(dt) {
+    if (!this.wave_active) {
+      this.countdown -= dt;
+      if (this.countdown <= 0) this.startWave();
+      return;
+    }
+    this.spawn_t -= dt;
+    if (this.spawn_queue.length && this.spawn_t <= 0) {
+      const e = this.entries[this.spawn_queue.shift()];
+      const x = clamp(e.x + R.uniform(-14, 14), 4, WORLD_W - 4);
+      const y = clamp(e.y + R.uniform(-14, 14), 4, WORLD_H - 4);
+      this.virions.push(new Virion(this.cur_strain, x, y));
+      this.spawn_t = 0.5 / Math.sqrt(Math.max(1, this.active_entries.length));
+    }
+    if (!this.spawn_queue.length && !this.virions.length && !this.infectedCells().length) this.waveCleared();
+  }
+
+  // ============================== upgrades ===============================
+  buildUpgradeOptions() {
+    const opts = shuffle([
+      { type: "affinity", cost: 5 + (1 / this.ab_cd_mult - 1) * 10 },
+      { type: "ifn", cost: 5 + (this.ifn_mult - 1) * 10 },
+      { type: "marrow", cost: 5 + (1 / this.innate_cd_mult - 1) * 10 },
+      { type: "cd8", cost: 4 + (this.dmg_mods.killer_t - 1) * 10 },
+      { type: "nk", cost: 4 + (this.dmg_mods.nk - 1) * 10 },
+      { type: "complement", cost: 4 + this.zap_bonus },
+      { type: "repair", cost: 4 + (this.work_mult - 1) * 10 },
+      { type: "corehp", cost: 6 },
+    ]);
+    const picked = opts.slice(0, 5);
+    const ag = this.next_strain.antigen;
+    const st = this.antigens.get(ag);
+    if (!st || st.state !== "memory") picked.unshift({ type: "vaccine", cost: 8, antigen: ag });
+    else picked.push(opts[5]);
+    this.upgrade_options = picked.slice(0, 6);
+  }
+  buyUpgrade(opt) {
+    const cost = Math.round(opt.cost);
+    if (this.ap < cost) return;
+    this.ap -= cost;
+    const t = opt.type;
+    if (t === "vaccine") {
+      this.antigens.set(opt.antigen, { state: "memory", t: 0, total: 0 });
+      this.fact = "Vaccines show your immune system a harmless piece of the virus, so memory " +
+                  "B and T cells are ready before the real infection.";
+    } else if (t === "affinity") this.ab_cd_mult *= 0.8;
+    else if (t === "ifn") { this.ifn_mult += 0.25; this.ifn_protect = Math.min(0.9, this.ifn_protect + 0.05); }
+    else if (t === "marrow") this.innate_cd_mult *= 0.85;
+    else if (t === "cd8") this.dmg_mods.killer_t += 0.2;
+    else if (t === "nk") this.dmg_mods.nk += 0.2;
+    else if (t === "complement") this.zap_bonus += 2;
+    else if (t === "repair") this.work_mult += 0.2;
+    else if (t === "corehp") {
+      this.core.max_hp += 60;
+      this.core.hp = Math.min(this.core.max_hp, this.core.hp + 60);
+    }
+    this.upgrade_options.splice(this.upgrade_options.indexOf(opt), 1);
+  }
+  upgradeText(opt) {
+    return {
+      vaccine: [`Vaccinate vs Strain ${opt.antigen}`,
+                "Gives memory cells for the expected next strain - the adaptive response starts much faster."],
+      affinity: ["Affinity Maturation",
+                 "B cells pick antibodies that stick tighter: plasma cells neutralize virus 20% faster."],
+      ifn: ["Interferon Signaling", "Interferon reaches 25% further and blocks infection more often."],
+      marrow: ["Bone-Marrow Output", "Innate depots produce cells 15% faster."],
+      cd8: ["CD8 T-Cell Training", "New CD8 T cells kill infected cells 20% faster."],
+      nk: ["NK Activation (IL-15)", "New NK cells kill infected cells 20% faster."],
+      complement: ["Complement Boost", "Complement at the lymph node destroys free virus faster."],
+      repair: ["Fibroblast Repair", "Worker cells move, build and repair 20% faster."],
+      corehp: ["Reinforce Lymph Node", "+60 max health for the lymph node and heal 60 now."],
+    }[opt.type];
+  }
+
+  // =============================== update ================================
+  updateCamera(dt) {
+    const k = input.keys;
+    const dx = (k.has("KeyD") || k.has("ArrowRight") ? 1 : 0) - (k.has("KeyA") || k.has("ArrowLeft") ? 1 : 0);
+    const dy = (k.has("KeyS") || k.has("ArrowDown") ? 1 : 0) - (k.has("KeyW") || k.has("ArrowUp") ? 1 : 0);
+    this.cam_x = clamp(this.cam_x + dx * CAM_SPEED * dt, 0, WORLD_W - VIEW_W);
+    this.cam_y = clamp(this.cam_y + dy * CAM_SPEED * dt, 0, WORLD_H - VIEW_H);
+  }
+
+  updateSim(dt) {
+    this.stats.time += dt;
+    this.rate_t += dt;
+    if (this.rate_t >= 1.0) {
+      for (const r in this.rate) {
+        this.rate[r] = this.rate[r] * 0.5 + this.rate_acc[r] / this.rate_t * 0.5;
+        this.rate_acc[r] = 0;
+      }
+      this.rate_t = 0;
+    }
+    for (const k in this.alert_cd) this.alert_cd[k] -= dt;
+
+    // every cell burns glucose from the blood to make its own ATP
+    const upkeep = 0.06 * this.workers.length + 0.1 * this.units.length;
+    this.addRes("atp", -upkeep * dt);
+    if (this.res.atp < 0) {
+      this.res.atp = 0;
+      if (!this.starving)
+        this.alert("Blood glucose ran out! Cells can't make their own ATP and are starving - " +
+                   "build Capillary Beds or a Liver Lobule.", RED);
+      this.starving = true;
+    } else if (this.res.atp > 2) {
+      this.starving = false;
+    }
+    if (this.starving) for (const c of [...this.workers, ...this.units]) c.hp -= 0.6 * dt;
+
+    for (const b of [...this.buildings]) b.update(dt, this);
+    this.updateAdaptive(dt);
+
+    if (this.auto_grow && this.workers.length < this.worker_target) {
+      this.grow_t += dt;
+      if (this.grow_t >= 5.0) { this.grow_t = 0; this.growWorker(true); }
+    }
+
+    for (const w of this.workers) w.update(dt, this);
+    for (const u of this.units) u.update(dt, this);
+    for (const v of this.virions) if (v.alive()) v.update(dt, this);
+
+    Game.separate(this.units, 13);
+    Game.separate(this.virions, 10);
+
+    for (const b of [...this.buildings]) {
+      if (b.hp <= 0) {
+        if (b.strain) {
+          if (b.infection >= 100) {
+            this.releaseVirions(b.x, b.y, b.strain, 4);
+            this.alert(`Infected ${this.name(b.d)} burst open and released virus!`, RED);
+          }
+          b.strain = null;
+        }
+        this.destroyBuilding(b);
+        if (this.state !== "PLAYING") return;
+      }
+    }
+    for (const w of this.workers) if (!w.alive()) w.release();
+    this.workers = this.workers.filter(w => w.alive());
+    this.units = this.units.filter(u => u.alive());
+    this.virions = this.virions.filter(v => v.alive());
+    if (this.sel_worker && !this.sel_worker.alive()) this.sel_worker = null;
+
+    this.updateWaves(dt);
+  }
+
+  static separate(group, r) {
+    const n = group.length;
+    for (let i = 0; i < n; i++) {
+      const a = group[i];
+      for (let j = i + 1; j < n; j++) {
+        const b = group[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        if (Math.abs(dx) < r && Math.abs(dy) < r) {
+          let d = Math.hypot(dx, dy);
+          if (d < r) {
+            if (d < 0.01) { dx = R.uniform(-1, 1); dy = R.uniform(-1, 1); d = 1.0; }
+            const push = (r - d) * 0.25 / d;
+            a.x -= dx * push; a.y -= dy * push;
+            b.x += dx * push; b.y += dy * push;
+          }
+        }
+      }
+    }
+  }
+
+  updateFx(dt) {
+    for (const f of this.fx) f.t -= dt;
+    this.fx = this.fx.filter(f => f.t > 0);
+    for (const a of this.alerts) a[2] -= dt;
+    this.alerts = this.alerts.filter(a => a[2] > 0);
+  }
+
+  // ================================ input ================================
+  handleClick(x, y) {
+    for (let i = this.click_targets.length - 1; i >= 0; i--) {
+      const [rect, action] = this.click_targets[i];
+      if (rect.collidepoint(x, y)) { action(); return true; }
+    }
+    return false;
+  }
+  go(state) {
+    if (state === "HOWTO" || state === "OPTIONS") { this.prev_state = this.state; this.howto_page = 0; }
+    this.state = state;
+  }
+
+  handleKey(key) {
+    if (key === "m") this.medical = !this.medical;
+    const st = this.state;
+    if (st === "HOWTO" || st === "OPTIONS") {
+      if (key === "escape") this.state = this.prev_state;
+      return;
+    }
+    if (st === "MENU") { if (key === "enter") this.newGame(); return; }
+    if (st === "PAUSED") { if (key === "escape") this.state = "PLAYING"; return; }
+    if (st === "ADAPT") { if (key === "enter" || key === "escape") this.state = "PLAYING"; return; }
+    if (st !== "PLAYING") return;
+
+    if (key === "escape") {
+      if (this.build_key) this.build_key = null;
+      else if (this.sel_building || this.sel_worker || this.units.some(u => u.selected)) this.clearSelection();
+      else this.state = "PAUSED";
+    } else if (key === " ") this.paused = !this.paused;
+    else if (key === "tab") this.setTab(TAB_ORDER[(TAB_ORDER.indexOf(this.tab) + 1) % TAB_ORDER.length]);
+    else if (key === "=" || key === "+") this.speed = Math.min(3, this.speed + 1);
+    else if (key === "-") this.speed = Math.max(1, this.speed - 1);
+    else if (key === "g") this.growWorker();
+    else if (key === "n") this.callWaveEarly();
+    else if (key === "h") this.centerOn(this.core.x, this.core.y);
+    else if (key === "f") { this.clearSelection(); for (const u of this.units) u.selected = true; }
+    else if (key === "delete" && this.sel_building) this.demolish(this.sel_building);
+    else if (key >= "1" && key <= "5" && key.length === 1) {
+      const i = Number(key) - 1;
+      if (i < TABS[this.tab].length) this.selectBuild(TABS[this.tab][i]);
+    }
+  }
+
+  selectBuild(key) {
+    this.build_key = this.build_key === key ? null : key;
+    this.clearSelection();
+  }
+  clearSelection() {
+    this.sel_building = null;
+    this.sel_worker = null;
+    for (const u of this.units) u.selected = false;
+  }
+  centerOn(x, y) {
+    this.cam_x = clamp(x - VIEW_W / 2, 0, WORLD_W - VIEW_W);
+    this.cam_y = clamp(y - VIEW_H / 2, 0, WORLD_H - VIEW_H);
+  }
+  ghostOrigin(wx, wy, key) {
+    const s = BUILDINGS[key].size;
+    return [Math.round(wx / TILE - s / 2), Math.round(wy / TILE - s / 2)];
+  }
+  canPlace(key, gx, gy) {
+    const d = BUILDINGS[key];
+    const s = d.size;
+    for (let ty = gy; ty < gy + s; ty++) {
+      for (let tx = gx; tx < gx + s; tx++) {
+        if (tx < 0 || tx >= MAP_W || ty < 0 || ty >= MAP_H) return [false, "Out of bounds."];
+        if (this.bgrid[ty][tx]) return [false, "That space is occupied."];
+        if (this.tiles[ty][tx] === T_VESSEL && !d.wall) return [false, "Only Barrier Walls can go on blood vessels."];
+      }
+    }
+    if (d.supply && this.vesselsTouching(gx, gy, s) === 0)
+      return [false, "A Capillary Bed must touch a blood vessel (dark red tiles)."];
+    if (!this.canAfford(d.cost)) return [false, "Not enough resources."];
+    return [true, ""];
+  }
+  tryPlace(wx, wy, quiet = false) {
+    const key = this.build_key;
+    const [gx, gy] = this.ghostOrigin(wx, wy, key);
+    const [ok, why] = this.canPlace(key, gx, gy);
+    if (!ok) { if (!quiet) this.alert(why, ORANGE); return; }
+    this.spend(BUILDINGS[key].cost);
+    this.placeBuilding(new Building(key, gx, gy));
+  }
+
+  worldMouseDown(button, pos) {
+    const [wx, wy] = this.s2w(...pos);
+    if (button === 2) { this.pan_drag = [pos, this.cam_x, this.cam_y]; return; }
+    if (button === 1) {
+      if (this.build_key) {
+        this.tryPlace(wx, wy);
+        this.painting = !!BUILDINGS[this.build_key].wall;
+      } else {
+        this.drag_start = pos;
+        this.drag_rect = null;
+      }
+    } else if (button === 3) {
+      if (this.build_key) { this.build_key = null; return; }
+      const sel = this.units.filter(u => u.selected);
+      if (sel.length) {
+        let target = null;
+        for (const v of this.virions) if (dist([wx, wy], [v.x, v.y]) < 14) { target = v; break; }
+        if (!target) {
+          for (const c of this.infectedCells()) {
+            const r = c instanceof Worker ? 12 : c.size * TILE / 2;
+            if (dist([wx, wy], [c.x, c.y]) <= r) { target = c; break; }
+          }
+        }
+        for (const u of sel) {
+          u.manual = true;
+          if (target && this.targetAlive(target, u)) { u.target = target; u.move_target = null; }
+          else { u.target = null; u.move_target = [wx + R.uniform(-14, 14), wy + R.uniform(-14, 14)]; }
+        }
+        this.fx.push({ kind: "order", x: wx, y: wy, t: 0.5, life: 0.5, color: target ? RED : GREEN });
+      } else if (this.sel_building && this.sel_building.d.unit) {
+        const b = this.sel_building;
+        b.rally = [wx, wy];
+        for (const u of this.units) if (u.home === b && !u.manual) u.post = this.postFor(b);
+        this.fx.push({ kind: "order", x: wx, y: wy, t: 0.5, life: 0.5, color: CYAN });
+      }
+    }
+  }
+  mouseUp(button, pos, shift) {
+    if (button === 2) this.pan_drag = null;
+    if (button !== 1) return;
+    this.painting = false;
+    this.mm_drag = false;
+    if (!this.drag_start) return;
+    const start = this.drag_start;
+    this.drag_start = null;
+    const r = this.drag_rect;
+    this.drag_rect = null;
+    if (r && (r.w > 4 || r.h > 4)) {
+      if (!shift) this.clearSelection();
+      for (const u of this.units) { const [sx, sy] = this.w2s(u.x, u.y); if (r.collidepoint(sx, sy)) u.selected = true; }
+      return;
+    }
+    const [wx, wy] = this.s2w(...start);
+    if (!shift) this.clearSelection();
+    for (const u of this.units) if (dist([wx, wy], [u.x, u.y]) < 12) { u.selected = true; return; }
+    for (const w of this.workers) if (dist([wx, wy], [w.x, w.y]) < 10) { this.sel_worker = w; return; }
+    const b = this.buildingAt(wx, wy);
+    if (b) this.sel_building = b;
+  }
+  mouseMotion(pos) {
+    if (this.state !== "PLAYING") return;
+    if (this.pan_drag) {
+      const [[sx, sy], cx, cy] = this.pan_drag;
+      this.cam_x = clamp(cx - (pos[0] - sx), 0, WORLD_W - VIEW_W);
+      this.cam_y = clamp(cy - (pos[1] - sy), 0, WORLD_H - VIEW_H);
+    }
+    if (this.mm_drag) this.minimapJump(pos);
+    if (this.painting && this.build_key && VIEW_RECT.collidepoint(...pos)) this.tryPlace(...this.s2w(...pos), true);
+    if (this.drag_start) {
+      const [sx, sy] = this.drag_start;
+      this.drag_rect = new Rect(Math.min(sx, pos[0]), Math.min(sy, pos[1]), Math.abs(pos[0] - sx), Math.abs(pos[1] - sy));
+    }
+  }
+  minimapRect() { return new Rect(WIDTH - MM_W - 10, HEIGHT - BOTTOM_H + 6, MM_W, MM_H); }
+  minimapJump(pos) {
+    const r = this.minimapRect();
+    const fx = clamp((pos[0] - r.x) / MM_W, 0, 1);
+    const fy = clamp((pos[1] - r.y) / MM_H, 0, 1);
+    this.centerOn(fx * WORLD_W, fy * WORLD_H);
+  }
+  startMinimapDrag() { this.mm_drag = true; this.minimapJump(input.mouse); }
+
+  // =========================== drawing: world ============================
+  drawWorld() {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(VIEW_RECT.x, VIEW_RECT.y, VIEW_RECT.w, VIEW_RECT.h); ctx.clip();
+    const cx = Math.trunc(this.cam_x), cy = Math.trunc(this.cam_y);
+    ctx.drawImage(this.map, cx * DPR, cy * DPR, VIEW_W * DPR, VIEW_H * DPR, 0, TOP_H, VIEW_W, VIEW_H);
+
+    this.drawEntryMarkers();
+    const sel_b = this.sel_building;
+    if (sel_b && sel_b.d.boost) this.drawRing(sel_b.x, sel_b.y, sel_b.d.boost, [225, 95, 110]);
+    if (this.build_key === "arteriole" || this.build_key === "hub")
+      for (const b of this.buildings) if (b.d.boost) this.drawRing(b.x, b.y, b.d.boost, [225, 95, 110]);
+    if (sel_b && sel_b.d.aura) this.drawRing(sel_b.x, sel_b.y, sel_b.d.aura, [255, 185, 70]);
+    if (this.build_key && BUILDINGS[this.build_key].aura)
+      for (const b of this.buildings) if (b.d.aura) this.drawRing(b.x, b.y, b.d.aura, [255, 185, 70]);
+
+    for (const b of this.buildings) this.drawBuilding(b);
+    for (const w of this.workers) this.drawWorker(w);
+    for (const u of this.units) this.drawUnit(u);
+    for (const v of this.virions) this.drawVirion(v);
+    this.drawFx();
+
+    if (sel_b && sel_b.rally) {
+      const a = this.w2s(sel_b.x, sel_b.y), b = this.w2s(...sel_b.rally);
+      drawLine(ctx, CYAN, a, b, 1);
+      drawCircle(ctx, CYAN, b, 6, 2);
+    }
+    this.drawGhost();
+    if (this.drag_rect) {
+      const r = this.drag_rect;
+      drawRect(ctx, "rgba(90,200,255,0.2)", r);
+      drawRect(ctx, [90, 200, 255], r, 1);
+    }
+    ctx.restore();
+  }
+  drawRing(x, y, r, color) {
+    const [sx, sy] = this.w2s(x, y);
+    drawCircle(ctx, css(color, 20 / 255), [sx, sy], r);
+    drawCircle(ctx, css(color, 120 / 255), [sx, sy], r, 2);
+  }
+  visible(sx, sy, pad = 40) {
+    return -pad < sx && sx < VIEW_W + pad && TOP_H - pad < sy && sy < TOP_H + VIEW_H + pad;
+  }
+  drawEntryMarkers() {
+    const idxs = this.wave_active ? this.active_entries : this.next_entries;
+    const pulse = 0.5 + 0.5 * Math.sin(this.time * 5);
+    for (const i of idxs) {
+      const e = this.entries[i];
+      const [sx, sy] = this.w2s(e.x, e.y);
+      if (this.visible(sx, sy)) {
+        drawCircle(ctx, RED, [sx, sy], Math.trunc(18 + pulse * 8), 3);
+        this.text("!", this.f_med, RED, sx, sy - 14, "c");
+      }
+    }
+  }
+  drawHp(x, y, w, frac, color) {
+    drawRect(ctx, [30, 20, 24], new Rect(x - Math.floor(w / 2), y, w, 4));
+    drawRect(ctx, color, new Rect(x - Math.floor(w / 2), y, Math.trunc(w * clamp(frac, 0, 1)), 4));
+  }
+  drawBuilding(b) {
+    const r = b.rect.move(-Math.trunc(this.cam_x), -Math.trunc(this.cam_y) + TOP_H);
+    if (!r.colliderect(VIEW_RECT)) return;
+    const col = b.d.color;
+    const inner = r.inflate(-4, -4);
+    if (!b.built) {
+      drawRect(ctx, css(col, 55 / 255), inner);
+      drawRect(ctx, col, inner, 2, 6);
+      this.drawHp(r.centerx, r.bottom - 8, inner.w - 8, b.progress / b.d.work, CYAN);
+      if (b.builders === 0 && b.size > 1) this.text("queued", this.f_small, GREY, r.centerx, r.centery - 8, "c");
+    } else {
+      const k = b.key;
+      if (k === "barrier") {
+        drawRect(ctx, darker(col, 0.55), r.inflate(-2, -2), 0, 5);
+        drawRect(ctx, col, r.inflate(-6, -10), 0, 4);
+        for (let i = 0; i < 4; i++) {
+          const x = r.x + 6 + i * 7;
+          drawCircle(ctx, [250, 200, 220], [x, r.y + 6], 3);
+          drawCircle(ctx, [250, 200, 220], [x, r.bottom - 6], 3);
+        }
+      } else if (k === "core") {
+        const pulse = 0.5 + 0.5 * Math.sin(this.time * 2);
+        drawRect(ctx, darker(col, 0.5), r.inflate(10, 10), 0, 18);
+        drawRect(ctx, col, r, 0, 14);
+        drawRect(ctx, [200, 170, 255], r, 2, 14);
+        drawCircle(ctx, [170, 140, 235], [r.centerx, r.centery], Math.trunc(22 + pulse * 6), 3);
+        this.text(this.medical ? "LYMPH NODE" : "CORE", this.medical ? this.f_small : this.f_bold,
+                  WHITE, r.centerx, r.centery - 10, "c");
+        if ([...this.antigens.values()].some(st => st.state === "learning"))
+          drawCircle(ctx, CYAN, [r.centerx, r.centery], Math.trunc(34 + pulse * 6), 2);
+      } else if (k === "hub") {
+        drawRect(ctx, darker(col, 0.5), inner, 0, 6);
+        drawCircle(ctx, col, [inner.centerx, inner.centery], 9);
+        drawCircle(ctx, [255, 150, 160], [inner.centerx, inner.centery], 4);
+        if (b.enabled) {
+          // glucose (yellow) and amino acids (green) seeping out of the blood
+          const ph = (this.time * 0.8 + b.gx * 0.37) % 1.0;
+          [YELLOW, GREEN].forEach((c, i) => {
+            const a = ph * TAU + i * Math.PI, rr = 6 + ph * 12;
+            drawCircle(ctx, c, [Math.trunc(inner.centerx + Math.cos(a) * rr), Math.trunc(inner.centery + Math.sin(a) * rr)], 2);
+          });
+        }
+      } else {
+        drawRect(ctx, darker(col, 0.5), inner, 0, 9);
+        drawRect(ctx, col, inner.inflate(-6, -6), 0, 7);
+        const cx = inner.centerx, cy = inner.centery;
+        const dk = darker(col, 0.45);
+        if (k === "liver") {
+          const pts = [];
+          for (let i = 0; i < 6; i++) pts.push([cx + 13 * Math.cos(i * Math.PI / 3), cy + 13 * Math.sin(i * Math.PI / 3)]);
+          drawPoly(ctx, dk, pts, 3);
+          drawCircle(ctx, dk, [cx, cy], 4);
+        } else if (k === "arteriole") {
+          drawRect(ctx, dk, new Rect(cx - 18, cy - 7, 36, 14), 3, 7);
+          const pulse = 0.5 + 0.5 * Math.sin(this.time * 4);
+          drawCircle(ctx, [255, 160, 170], [Math.trunc(cx - 12 + pulse * 24), cy], 3);
+        } else if (k === "house") {
+          for (const [ox, oy] of [[-8, 4], [8, 4], [0, -8]]) {
+            drawCircle(ctx, [255, 230, 240], [cx + ox, cy + oy], 7);
+            drawCircle(ctx, dk, [cx + ox, cy + oy], 7, 2);
+          }
+        } else if (k === "helper") {
+          drawShape(ctx, "star", dk, [cx, cy], 15);
+        } else if (b.d.unit) {
+          drawShape(ctx, CELL_TYPES[b.d.unit].shape, dk, [cx, cy], 11);
+          if (b.d.adaptive && this.active.size === 0)
+            this.text("waiting", this.f_small, darker(col, 0.3), cx, cy + 10, "c");
+          else if (b.enabled && !b.strain)
+            drawArc(ctx, WHITE, inner.inflate(-10, -10), Math.PI / 2,
+                    Math.PI / 2 + TAU * Math.min(1, b.timer / b.d.spawn_cd), 2);
+        }
+        if (!b.enabled) this.text("OFF", this.f_bold, [255, 120, 120], cx, cy - 10, "c");
+      }
+    }
+    if (b.antiviral > 0 && !b.strain && b !== this.core) drawRect(ctx, IFN_COL, r.inflate(2, 2), 1, 8);
+    if (b.strain) {
+      const pulse = 0.5 + 0.5 * Math.sin(this.time * 6);
+      drawRect(ctx, css(INFECT, (90 + 60 * pulse) / 255), r);
+      const rng = makeRng(b.uid * 2654435761);
+      for (let i = 0; i < 2 + Math.trunc(b.infection / 20); i++) {
+        const px = r.x + rng.randint(6, r.w - 6), py = r.y + rng.randint(6, r.h - 6);
+        drawPoly(ctx, b.strain.color, spiky([px, py], 4, 6, this.time));
+      }
+      this.drawHp(r.centerx, r.bottom + 3, r.w - 4, b.infection / 100, INFECT);
+    }
+    if (b === this.sel_building) drawRect(ctx, WHITE, r.inflate(4, 4), 2, 8);
+    if (b.hit_flash > 0) drawRect(ctx, [255, 90, 90], r, 3, 8);
+    if (b.hp < b.max_hp) this.drawHp(r.centerx, r.y - 7, r.w - 4, b.hp / b.max_hp, GREEN);
+  }
+  drawWorker(w) {
+    const [sx, sy] = this.w2s(w.x, w.y);
+    if (!this.visible(sx, sy)) return;
+    const col = w.strain ? INFECT : WORKER_DEF.color;
+    drawCircle(ctx, col, [sx, sy], 6);
+    drawCircle(ctx, darker(col, 0.45), [sx, sy], 6, 1);
+    drawCircle(ctx, darker(col, 0.45), [sx, sy], 2);
+    if (w.strain) {
+      const frac = clamp(w.eclipse / w.strain.eclipse, 0, 1);
+      drawArc(ctx, RED, new Rect(sx - 10, sy - 10, 20, 20), Math.PI / 2, Math.PI / 2 + TAU * frac, 2);
+    } else if (w.antiviral > 0) {
+      drawCircle(ctx, IFN_COL, [sx, sy], 9, 1);
+    }
+    if (w === this.sel_worker) drawCircle(ctx, WHITE, [sx, sy], 12, 1);
+  }
+  drawUnit(u) {
+    const [sx, sy] = this.w2s(u.x, u.y);
+    if (!this.visible(sx, sy)) return;
+    drawShape(ctx, u.shape, u.color, [sx, sy], 8);
+    drawCircle(ctx, u.selected ? WHITE : BLACK, [sx, sy], 10, u.selected ? 2 : 1);
+    if (u.carrying) drawCircle(ctx, RED, [sx + 7, sy - 7], 4);
+    if (u.hp < u.max_hp) this.drawHp(sx, sy - 15, 18, u.hp / u.max_hp, GREEN);
+  }
+  drawVirion(v) {
+    if (!v.alive()) return;
+    const [sx, sy] = this.w2s(v.x, v.y);
+    if (!this.visible(sx, sy)) return;
+    let col = v.neutralized ? lerpCol(v.color, IFN_COL, 0.6) : v.color;
+    if (v.life < 8) col = lerpCol(BG, col, clamp(v.life / 8, 0.2, 1));
+    drawPoly(ctx, col, spiky([sx, sy], 7, 7, v.rot));
+    drawCircle(ctx, darker(col, 0.5), [sx, sy], 2);
+    if (v.neutralized) {
+      // antibodies (Y shapes) stuck to the virus
+      for (const a of [v.rot, v.rot + 2.1, v.rot + 4.2]) {
+        const ex = sx + Math.cos(a) * 10, ey = sy + Math.sin(a) * 10;
+        drawLine(ctx, IFN_COL, [sx + Math.cos(a) * 6, sy + Math.sin(a) * 6], [ex, ey], 1);
+        drawLine(ctx, IFN_COL, [ex, ey], [ex + Math.cos(a + 0.6) * 3, ey + Math.sin(a + 0.6) * 3], 1);
+        drawLine(ctx, IFN_COL, [ex, ey], [ex + Math.cos(a - 0.6) * 3, ey + Math.sin(a - 0.6) * 3], 1);
+      }
+    }
+  }
+  drawFx() {
+    for (const f of this.fx) {
+      const a = f.t / f.life;
+      const [sx, sy] = this.w2s(f.x, f.y);
+      const k = f.kind;
+      if (k === "shot") drawLine(ctx, f.color, [sx, sy], this.w2s(f.x2, f.y2), 2);
+      else if (k === "hit") drawCircle(ctx, f.color, [sx, sy], Math.trunc(4 + (1 - a) * 6), 1);
+      else if (k === "pop") drawCircle(ctx, f.color, [sx, sy], Math.trunc(6 + (1 - a) * 22), 2);
+      else if (k === "order") drawCircle(ctx, f.color, [sx, sy], Math.trunc(4 + a * 12), 2);
+      else if (k === "ifn") drawCircle(ctx, f.color, [sx, sy], Math.max(2, Math.trunc(f.r * (1 - a))), 2);
+      else if (k === "text") {
+        ctx.globalAlpha = a;
+        this.text(f.text, this.f_small, f.color, sx, sy - Math.trunc((1 - a) * 18), "c");
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+  drawGhost() {
+    if (!this.build_key) return;
+    const pos = input.mouse;
+    if (!VIEW_RECT.collidepoint(...pos)) return;
+    const key = this.build_key;
+    const d = BUILDINGS[key];
+    const [gx, gy] = this.ghostOrigin(...this.s2w(...pos), key);
+    const [ok] = this.canPlace(key, gx, gy);
+    const rect = new Rect(gx * TILE - Math.trunc(this.cam_x), gy * TILE - Math.trunc(this.cam_y) + TOP_H,
+                          d.size * TILE, d.size * TILE);
+    drawRect(ctx, ok ? css(d.color, 110 / 255) : "rgba(220,60,60,0.43)", rect);
+    drawRect(ctx, ok ? WHITE : RED, rect, 2, 4);
+    const wx = rect.centerx + this.cam_x, wy = rect.centery + this.cam_y - TOP_H;
+    if (d.aura) this.drawRing(wx, wy, d.aura, [255, 185, 70]);
+    if (d.boost) this.drawRing(wx, wy, d.boost, [225, 95, 110]);
+    if (d.supply) {
+      const n = this.vesselsTouching(gx, gy, d.size);
+      let label, col;
+      if (n) {
+        const m = 0.6 + CAP_PER_VESSEL * Math.min(n, CAP_MAX_VESSELS);
+        label = `+${(CAP_BASE.atp * m).toFixed(1)} ${RES_SHORT.atp}  +${(CAP_BASE.bio * m).toFixed(1)} ${RES_SHORT.bio} /s`;
+        col = GREEN;
+      } else { label = "Must touch a blood vessel"; col = RED; }
+      const w = this.measure(label, this.f_small);
+      drawRect(ctx, "rgba(10,6,12,0.7)", new Rect(rect.centerx - w / 2 - 6, rect.y - 23, w + 12, 20), 0, 5);
+      this.text(label, this.f_small, col, rect.centerx, rect.y - 20, "c");
+    }
+  }
+
+  // ============================ drawing: HUD =============================
+  drawTopbar() {
+    drawRect(ctx, PANEL, new Rect(0, 0, WIDTH, TOP_H));
+    drawLine(ctx, PANEL_EDGE, [0, TOP_H - 1], [WIDTH, TOP_H - 1], 2);
+    const resBlock = (x, label, val, rate, color) => {
+      this.text(label, this.f_small, GREY, x, 4);
+      const w = this.text(`${Math.trunc(val)}`, this.f_med, color, x, 18);
+      if (rate !== null) this.text(`${fmtSigned(rate, 1)}/s`, this.f_small, rate >= 0 ? GREEN : RED, x + w + 6, 25);
+    };
+    resBlock(14, "Blood glucose", this.res.atp, this.rate.atp, YELLOW);
+    resBlock(170, "Amino acids", this.res.bio, this.rate.bio, GREEN);
+    resBlock(326, "Adaptation", this.ap, null, CYAN);
+    this.text("Population", this.f_small, GREY, 430, 4);
+    const pc = this.pop() >= this.pop_cap ? ORANGE : WHITE;
+    this.text(`${this.pop()}/${this.pop_cap}`, this.f_med, pc, 430, 18);
+    this.text(`${this.workers.length} tissue  ${this.units.length} immune`, this.f_small, GREY, 500, 25);
+
+    let msg, col;
+    if (this.wave_active) {
+      const inf = this.infectedCells().length;
+      const free = this.virions.length + this.spawn_queue.length;
+      msg = `WAVE ${this.wave}: ${free} virus, ${inf} infected`; col = RED;
+    } else {
+      const s = Math.max(0, Math.trunc(this.countdown));
+      msg = `Wave ${this.wave + 1} in ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+      col = this.countdown > 15 ? WHITE : ORANGE;
+    }
+    this.text(msg, this.f_med, col, 775, 12, "c");
+    if (this.starving) this.text("STARVING", this.f_bold, RED, 775, 30, "c");
+
+    const x = 920;
+    this.button([x, 9, 34, 30], "II", () => { this.paused = !this.paused; }, this.paused ? "on" : "normal");
+    for (const i of [1, 2, 3]) {
+      this.button([x + 4 + i * 38, 9, 34, 30], ">".repeat(i), () => { this.speed = i; this.paused = false; },
+                  this.speed === i && !this.paused ? "on" : "normal", true, this.f_small);
+    }
+    const bw = 140, bx = WIDTH - 154;
+    drawRect(ctx, [50, 20, 26], new Rect(bx, 22, bw, 14), 0, 4);
+    const pct = clamp(this.core.hp / this.core.max_hp, 0, 1);
+    const c = pct > 0.5 ? GREEN : (pct > 0.25 ? YELLOW : RED);
+    if (pct > 0) drawRect(ctx, c, new Rect(bx, 22, Math.trunc(bw * pct), 14), 0, 4);
+    this.text(`${this.medical ? "Lymph node" : "Core"} ${Math.trunc(Math.max(0, this.core.hp))}/${Math.trunc(this.core.max_hp)}`,
+              this.f_small, WHITE, bx, 4);
+  }
+  setTab(t) { this.tab = t; this.build_key = null; }
+
+  drawBottombar() {
+    const y0 = HEIGHT - BOTTOM_H;
+    drawRect(ctx, PANEL, new Rect(0, y0, WIDTH, BOTTOM_H));
+    drawLine(ctx, PANEL_EDGE, [0, y0], [WIDTH, y0], 2);
+
+    TAB_ORDER.forEach((t, i) => {
+      this.button([10, y0 + 10 + i * 39, 100, 34], t.toUpperCase(), () => this.setTab(t),
+                  this.tab === t ? "on" : "normal", true, this.f_small);
+    });
+
+    let hovered = null;
+    TABS[this.tab].forEach((key, i) => {
+      const d = BUILDINGS[key];
+      const rect = new Rect(120 + i * 136, y0 + 10, 130, 114);
+      const afford = this.canAfford(d.cost);
+      let bg = this.build_key === key ? [70, 92, 116] : PANEL_LIGHT;
+      if (rect.collidepoint(...input.mouse)) { hovered = key; bg = bg.map(c => Math.min(255, c + 16)); }
+      drawRect(ctx, bg, rect, 0, 8);
+      drawRect(ctx, d.color, rect, 2, 8);
+      const ic = [rect.x + 22, rect.y + 24];
+      if (d.unit) drawShape(ctx, CELL_TYPES[d.unit].shape, d.color, ic, 10);
+      else if (key === "helper") drawShape(ctx, "star", d.color, ic, 12);
+      else drawRect(ctx, d.color, new Rect(ic[0] - 10, ic[1] - 10, 20, 20), 0, 5);
+      this.text(`[${i + 1}]`, this.f_small, GREY, rect.right - 8, rect.y + 6, "r");
+      this.wrap(this.name(d), this.f_small, 118).slice(0, 2).forEach((line, li) =>
+        this.text(line, this.f_small, WHITE, rect.x + 8, rect.y + 44 + li * 16));
+      this.text(costStr(d.cost), this.f_small, afford ? YELLOW : RED, rect.x + 8, rect.bottom - 24);
+      this.click_targets.push([rect, () => this.selectBuild(key)]);
+    });
+
+    const wx = 120 + 5 * 136 + 4;
+    this.drawImmuneStatus(new Rect(wx, y0 + 10, WIDTH - MM_W - 24 - wx, 114));
+
+    const mr = this.minimapRect();
+    ctx.drawImage(this.map, mr.x, mr.y, MM_W, MM_H);
+    const sc = MM_W / WORLD_W;
+    for (const b of this.buildings) {
+      drawRect(ctx, b.strain ? INFECT : b.d.color,
+               new Rect(mr.x + b.gx * TILE * sc, mr.y + b.gy * TILE * sc,
+                        Math.max(2, b.size * TILE * sc), Math.max(2, b.size * TILE * sc)));
+    }
+    ctx.fillStyle = css(CYAN);
+    for (const u of this.units) ctx.fillRect(Math.trunc(mr.x + u.x * sc), Math.trunc(mr.y + u.y * sc), 1, 1);
+    for (const w of this.workers)
+      if (w.strain) drawCircle(ctx, INFECT, [Math.trunc(mr.x + w.x * sc), Math.trunc(mr.y + w.y * sc)], 2);
+    ctx.fillStyle = css(RED);
+    for (const v of this.virions) ctx.fillRect(mr.x + v.x * sc - 1, mr.y + v.y * sc - 1, 2, 2);
+    const idxs = this.wave_active ? this.active_entries : this.next_entries;
+    for (const i of idxs) {
+      const e = this.entries[i];
+      drawCircle(ctx, RED, [Math.trunc(mr.x + e.x * sc), Math.trunc(mr.y + e.y * sc)], 4, 1);
+    }
+    drawRect(ctx, WHITE, new Rect(mr.x + this.cam_x * sc, mr.y + this.cam_y * sc, VIEW_W * sc, VIEW_H * sc), 1);
+    drawRect(ctx, PANEL_EDGE, mr, 1);
+    this.click_targets.push([mr, () => this.startMinimapDrag()]);
+
+    if (hovered) this.drawTooltip(hovered);
+  }
+
+  /** Bottom panel: what the virus is doing and where the adaptive response is. */
+  drawImmuneStatus(box) {
+    drawRect(ctx, [34, 26, 38], box, 0, 8);
+    drawRect(ctx, [110, 60, 90], box, 2, 8);
+    const x = box.x + 10, y = box.y + 6;
+    if (this.wave_active && this.cur_strain) {
+      const s = this.cur_strain;
+      const ag = s.antigen;
+      const tag = { drift: " (drifted)", shift: " (NEW - shift)" }[s.change] || "";
+      this.text(`Strain ${ag}${tag}`, this.f_bold, s.color, x, y);
+      const st = this.antigens.get(ag);
+      let line, col;
+      if (!st) { line = "Adaptive: not started - a Dendritic Cell must bring antigen"; col = ORANGE; }
+      else if (st.state === "learning") {
+        line = `Adaptive: activating, ${Math.trunc(st.t)}s` + (this.helpFactor() < 2 ? "" : " (no Helper T: slow)");
+        col = CYAN;
+      } else if (st.state === "active") { line = "Adaptive: ACTIVE - CD8 T cells & antibodies"; col = GREEN; }
+      else { line = "Adaptive: memory ready"; col = GREEN; }
+      let ty = y + 22;
+      for (const ln of this.wrap(line, this.f_small, box.w - 20).slice(0, 2)) {
+        this.text(ln, this.f_small, col, x, ty); ty += 16;
+      }
+      ty += 2;
+      for (const tr of s.traits) {
+        for (const ln of this.wrap(TRAIT_TEXT[tr], this.f_small, box.w - 20).slice(0, 2)) {
+          if (ty < box.bottom - 16) this.text(ln, this.f_small, [230, 170, 220], x, ty);
+          ty += 16;
+        }
+      }
+      if (!s.traits.length) this.text("No special evasion tricks", this.f_small, GREY, x, ty);
+    } else {
+      this.text("Calm - no active infection", this.f_bold, WHITE, x, y);
+      const mem = [...this.antigens].filter(([, v]) => v.state === "memory").map(([k]) => k);
+      this.text("Immune memory: " + (mem.length ? mem.join(", ") : "none yet"), this.f_small, GREEN, x, y + 22);
+      const names = this.next_entries.map(i => this.entries[i].name).join(", ");
+      this.wrap(`Next virus enters from: ${names}`, this.f_small, box.w - 120).slice(0, 2).forEach((line, li) =>
+        this.text(line, this.f_small, ORANGE, x, y + 42 + li * 16));
+      this.button([box.right - 110, box.bottom - 38, 100, 30], "Call now [N]",
+                  () => this.callWaveEarly(), "danger", true, this.f_small);
+    }
+  }
+
+  drawTooltip(key) {
+    const d = BUILDINGS[key];
+    const lines = this.wrap(d.desc, this.f_small, 300);
+    const fact = this.wrap("Real biology: " + d.fact, this.f_small, 300);
+    const h = 54 + 16 * (lines.length + fact.length);
+    const r = new Rect(120, HEIGHT - BOTTOM_H - h - 8, 324, h);
+    drawRect(ctx, [24, 20, 30], r, 0, 8);
+    drawRect(ctx, d.color, r, 2, 8);
+    this.text(this.name(d), this.f_bold, WHITE, r.x + 12, r.y + 8);
+    this.text(`Cost: ${costStr(d.cost)}`, this.f_small, YELLOW, r.x + 12, r.y + 30);
+    let y = r.y + 48;
+    for (const line of lines) { this.text(line, this.f_small, [215, 210, 225], r.x + 12, y); y += 16; }
+    for (const line of fact) { this.text(line, this.f_small, CYAN, r.x + 12, y); y += 16; }
+  }
+
+  drawInfoPanel() {
+    const selUnits = this.units.filter(u => u.selected);
+    const b = this.sel_building, w = this.sel_worker;
+    if (!(b || w || selUnits.length)) return;
+    const r = new Rect(WIDTH - 316, TOP_H + 10, 306, 0);
+    const lines = [], buttons = [];
+    const S = this.f_small;
+    if (b) {
+      const d = b.d;
+      lines.push([this.name(d), this.f_med, WHITE]);
+      if (b.strain) {
+        lines.push([`INFECTED by Strain ${b.strain.antigen} - ${Math.trunc(b.infection)}%`, this.f_bold, INFECT]);
+        lines.push(["The virus hijacked these cells: no work, only virus.", S, INFECT]);
+        lines.push(["NK / CD8 T cells must destroy it (costs some tissue).", S, GREY]);
+      } else if (b.antiviral > 0) {
+        lines.push(["Antiviral state (interferon): hard to infect", S, IFN_COL]);
+      }
+      if (!b.built)
+        lines.push([`Blueprint - ${Math.trunc(100 * b.progress / d.work)}% built ` +
+                    `(${b.builders} worker${b.builders !== 1 ? "s" : ""})`, S, CYAN]);
+      lines.push([`Health ${Math.trunc(b.hp)}/${Math.trunc(b.max_hp)}`, S, GREEN]);
+      if (d.supply && b.built && !b.strain) {
+        const m = this.supplyMult(b);
+        lines.push([`Touches ${b.vessels} vessel tile${b.vessels !== 1 ? "s" : ""}` +
+                    (this.boosted(b) ? " + arteriole boost" : ""), S, WHITE]);
+        lines.push([`Delivering +${(CAP_BASE.atp * m).toFixed(1)} glucose, ` +
+                    `+${(CAP_BASE.bio * m).toFixed(1)} amino acids /s`, S, YELLOW]);
+      }
+      for (const line of this.wrap(d.desc, S, 280)) lines.push([line, S, [215, 210, 225]]);
+      for (const line of this.wrap("Real biology: " + d.fact, S, 280)) lines.push([line, S, CYAN]);
+      if (b === this.core) {
+        lines.push([`Auto-grow keeps ${this.worker_target} worker cells`, S, WHITE]);
+        buttons.push([`Grow worker (${costStr(GROW_COST)}) [G]`, () => this.growWorker(), "primary"]);
+        buttons.push([`Auto-grow: ${this.auto_grow ? "ON" : "OFF"}`, () => { this.auto_grow = !this.auto_grow; },
+                      this.auto_grow ? "on" : "normal"]);
+        buttons.push(["Target workers  -", () => this.adjTarget(-1), "normal"]);
+        buttons.push(["Target workers  +", () => this.adjTarget(1), "normal"]);
+      } else if (!b.strain) {
+        if (d.unit && b.built) lines.push(["Right-click the map to set a rally point.", S, GREY]);
+        if (b.built && (d.unit || d.produce || d.supply))
+          buttons.push([`Production: ${b.enabled ? "ON" : "OFF"}`, () => { b.enabled = !b.enabled; },
+                        b.enabled ? "on" : "normal"]);
+        buttons.push([b.built ? "Demolish (50% refund) [Del]" : "Cancel blueprint", () => this.demolish(b), "danger"]);
+      }
+    } else if (w) {
+      lines.push([this.name(WORKER_DEF), this.f_med, WHITE]);
+      lines.push([w.status(this.medical), S, w.strain ? INFECT : YELLOW]);
+      if (w.antiviral > 0 && !w.strain) lines.push(["Antiviral state (interferon): hard to infect", S, IFN_COL]);
+      lines.push(["Tissue cells pick their own jobs: build > repair.", S, GREY]);
+      lines.push(["It takes glucose from the blood and makes its own ATP.", S, GREY]);
+      for (const line of this.wrap("Real biology: " + WORKER_DEF.fact, S, 280)) lines.push([line, S, CYAN]);
+    } else {
+      lines.push([`${selUnits.length} immune cell${selUnits.length !== 1 ? "s" : ""} selected`, this.f_med, WHITE]);
+      const counts = {};
+      for (const u of selUnits) counts[u.key] = (counts[u.key] || 0) + 1;
+      for (const [k, c] of Object.entries(counts)) {
+        lines.push([`${c} x ${this.name(CELL_TYPES[k])}`, S, CELL_TYPES[k].color]);
+        for (const line of this.wrap(CELL_TYPES[k].desc, S, 270)) lines.push(["   " + line, S, GREY]);
+      }
+      lines.push(["Right-click: move there and guard.", S, WHITE]);
+      lines.push(["Right-click a target: focus it.", S, WHITE]);
+    }
+    r.h = 16 + lines.reduce((s, [, f]) => s + f.h + 2, 0) + buttons.length * 36;
+    drawRect(ctx, "rgba(24,20,30,0.92)", r);
+    drawRect(ctx, PANEL_EDGE, r, 2, 8);
+    let y = r.y + 8;
+    for (const [t, f, c] of lines) { this.text(t, f, c, r.x + 12, y); y += f.h + 2; }
+    for (const [label, action, style] of buttons) {
+      this.button([r.x + 10, y + 2, r.w - 20, 30], label, action, style, true, S);
+      y += 36;
+    }
+  }
+  adjTarget(d) { this.worker_target = clamp(this.worker_target + d, 0, 40); }
+
+  drawAlerts() {
+    let y = TOP_H + 10;
+    for (const [msg, col, t] of this.alerts) {
+      const w = this.measure(msg, this.f);
+      const a = clamp(t / 1.0, 0, 1);
+      drawRect(ctx, `rgba(10,6,12,${(170 / 255) * a})`, new Rect(10, y, w + 16, this.f.h + 6));
+      ctx.globalAlpha = a;
+      this.text(msg, this.f, col, 18, y + 3);
+      ctx.globalAlpha = 1;
+      y += this.f.h + 10;
+    }
+  }
+  drawOffscreenArrows() {
+    const idxs = this.wave_active ? this.active_entries : this.next_entries;
+    const cx = VIEW_W / 2, cy = TOP_H + VIEW_H / 2;
+    for (const i of idxs) {
+      const e = this.entries[i];
+      const [sx, sy] = this.w2s(e.x, e.y);
+      if (this.visible(sx, sy, -10)) continue;
+      const ang = Math.atan2(sy - cy, sx - cx);
+      const ex = clamp(cx + Math.cos(ang) * 2000, 24, VIEW_W - 24);
+      const ey = clamp(cy + Math.sin(ang) * 2000, TOP_H + 24, TOP_H + VIEW_H - 24);
+      drawPoly(ctx, RED, [[ex + Math.cos(ang) * 14, ey + Math.sin(ang) * 14],
+                          [ex + Math.cos(ang + 2.5) * 12, ey + Math.sin(ang + 2.5) * 12],
+                          [ex + Math.cos(ang - 2.5) * 12, ey + Math.sin(ang - 2.5) * 12]]);
+    }
+  }
+  drawHints() {
+    const msg = this.build_key
+      ? "Left-click to place (hold & drag for barriers)   Right-click / ESC to cancel"
+      : "WASD pan  -  drag to select cells  -  right-click to order  -  SPACE pause  -  " +
+        "TAB build menu  -  F select all  -  H home  -  M terms";
+    const w = this.measure(msg, this.f_small);
+    const x = Math.floor((VIEW_W - w) / 2), y = TOP_H + VIEW_H - 22;
+    drawRect(ctx, "rgba(10,6,12,0.6)", new Rect(x - 7, y - 2, w + 14, 20));
+    this.text(msg, this.f_small, [190, 180, 200], x, y);
+    if (this.paused) this.text("PAUSED  (SPACE to resume)", this.f_med, YELLOW, VIEW_W / 2, TOP_H + 14, "c");
+  }
+  drawGame() {
+    drawRect(ctx, BG, new Rect(0, 0, WIDTH, HEIGHT));
+    this.drawWorld();
+    this.drawOffscreenArrows();
+    this.drawAlerts();
+    this.drawHints();
+    this.drawTopbar();
+    this.drawBottombar();
+    this.drawInfoPanel();
+  }
+
+  // =========================== drawing: menus ============================
+  newBlob(x) {
+    const kind = R.choice(["cell", "cell", "cell", "virus"]);
+    return {
+      x: x !== undefined ? x : WIDTH + 30, y: R.uniform(0, HEIGHT),
+      vx: -R.uniform(15, 50), r: R.uniform(6, 22), kind,
+      col: kind === "cell" ? R.choice(Object.values(CELL_TYPES).map(c => c.color)) : [200, 60, 70],
+      rot: R.uniform(0, 6),
+    };
+  }
+  drawMenuBg(dt) {
+    drawRect(ctx, BG, new Rect(0, 0, WIDTH, HEIGHT));
+    for (const b of this.menu_blobs) {
+      b.x += b.vx * dt; b.rot += dt;
+      if (b.x < -40) Object.assign(b, this.newBlob());
+      const col = lerpCol(BG, b.col, 0.35);
+      if (b.kind === "virus") drawPoly(ctx, col, spiky([b.x, b.y], b.r, 8, b.rot));
+      else drawCircle(ctx, col, [b.x, b.y], b.r);
+    }
+  }
+  dim(alpha = 170) { drawRect(ctx, `rgba(8,4,10,${alpha / 255})`, new Rect(0, 0, WIDTH, HEIGHT)); }
+  panel(rect) {
+    drawRect(ctx, [28, 23, 34], rect, 0, 14);
+    drawRect(ctx, PANEL_EDGE, rect, 2, 14);
+  }
+  drawMenu(dt) {
+    this.drawMenuBg(dt);
+    const bob = Math.sin(this.time * 1.5) * 4;
+    this.text("IMMUNE COLONY", this.f_title, [25, 12, 30], WIDTH / 2 + 4, 104 + bob, "c");
+    this.text("IMMUNE COLONY", this.f_title, WHITE, WIDTH / 2, 100 + bob, "c");
+    this.text("Run a colony of living cells. Fight a virus the way your body really does.",
+              this.f, [200, 190, 215], WIDTH / 2, 192, "c");
+    const bx = WIDTH / 2 - 140, by = 260, bw = 280, bh = 54;
+    const items = [];
+    if (this.has_game && this.core && this.core.hp > 0)
+      items.push(["Continue", () => { this.state = "PLAYING"; }, "primary"]);
+    items.push(["New Game", () => this.newGame(), items.length ? "normal" : "primary"],
+               ["How to Play", () => this.go("HOWTO"), "normal"],
+               ["Options", () => this.go("OPTIONS"), "normal"]);
+    items.forEach(([label, action, style], i) =>
+      this.button([bx, by + i * 66, bw, bh], label, action, style, true, this.f_med));
+    this.text(`Difficulty: ${this.difficulty}    Terms: ${this.medical ? "Medical" : "Simple"}`,
+              this.f_small, GREY, WIDTH / 2, HEIGHT - 70, "c");
+    this.text("Best played with a mouse and keyboard.", this.f_small, GREY, WIDTH / 2, HEIGHT - 50, "c");
+    this.text("Prototype - placeholder art", this.f_small, [90, 84, 100], WIDTH / 2, HEIGHT - 30, "c");
+  }
+  drawHowto(dt) {
+    if (this.prev_state === "PAUSED") { this.drawGame(); this.dim(200); }
+    else this.drawMenuBg(dt);
+    const r = new Rect(120, 40, WIDTH - 240, HEIGHT - 80);
+    this.panel(r);
+    const [title, sections] = HOWTO_PAGES[this.howto_page];
+    this.text(`HOW TO PLAY - ${title}`, this.f_big, WHITE, r.centerx, r.y + 16, "c");
+    let y = r.y + 80;
+    for (const [head, col, lines] of sections) {
+      this.text(head, this.f_bold, col, r.x + 40, y);
+      y += 26;
+      for (const line of lines) { this.text(line, this.f_small, [215, 210, 225], r.x + 52, y); y += 19; }
+      y += 14;
+    }
+    const n = HOWTO_PAGES.length;
+    this.text(`Page ${this.howto_page + 1}/${n}`, this.f_small, GREY, r.centerx, r.bottom - 92, "c");
+    this.button([r.x + 40, r.bottom - 66, 160, 46], "< Prev", () => this.page(-1), "normal",
+                this.howto_page > 0, this.f_med);
+    this.button([r.right - 200, r.bottom - 66, 160, 46], "Next >", () => this.page(1), "normal",
+                this.howto_page < n - 1, this.f_med);
+    this.button([r.centerx - 100, r.bottom - 66, 200, 46], "Back", () => { this.state = this.prev_state; },
+                "primary", true, this.f_med);
+  }
+  page(d) { this.howto_page = clamp(this.howto_page + d, 0, HOWTO_PAGES.length - 1); }
+  drawOptions(dt) {
+    if (this.prev_state === "PAUSED") { this.drawGame(); this.dim(200); }
+    else this.drawMenuBg(dt);
+    const r = new Rect(WIDTH / 2 - 260, 140, 520, 420);
+    this.panel(r);
+    this.text("OPTIONS", this.f_big, WHITE, r.centerx, r.y + 20, "c");
+    this.button([r.x + 60, r.y + 100, r.w - 120, 52], `Terminology: ${this.medical ? "Medical" : "Simple"}  [M]`,
+                () => { this.medical = !this.medical; }, "normal", true, this.f_med);
+    this.text("Simple names for beginners, real immunology terms for learning.",
+              this.f_small, GREY, r.centerx, r.y + 158, "c");
+    const order = Object.keys(DIFFICULTY);
+    const nxt = order[(order.indexOf(this.difficulty) + 1) % order.length];
+    this.button([r.x + 60, r.y + 200, r.w - 120, 52], `Difficulty: ${this.difficulty}`,
+                () => { this.difficulty = nxt; }, "normal", true, this.f_med);
+    this.text("Applies when you start a new game.", this.f_small, GREY, r.centerx, r.y + 258, "c");
+    this.button([r.centerx - 100, r.bottom - 76, 200, 50], "Back", () => { this.state = this.prev_state; },
+                "primary", true, this.f_med);
+  }
+  drawPause() {
+    this.drawGame();
+    this.dim();
+    const r = new Rect(WIDTH / 2 - 170, 170, 340, 340);
+    this.panel(r);
+    this.text("PAUSED", this.f_big, WHITE, r.centerx, r.y + 20, "c");
+    const items = [["Resume", () => { this.state = "PLAYING"; }, "primary"],
+                   ["How to Play", () => this.go("HOWTO"), "normal"],
+                   ["Options", () => this.go("OPTIONS"), "normal"],
+                   ["Main Menu", () => { this.state = "MENU"; }, "normal"]];
+    items.forEach(([label, action, style], i) =>
+      this.button([r.x + 40, r.y + 90 + i * 60, r.w - 80, 48], label, action, style, true, this.f_med));
+  }
+  drawAdapt() {
+    this.drawGame();
+    this.dim(200);
+    this.text(`INFECTION ${this.wave} CLEARED`, this.f_big, GREEN, WIDTH / 2, 36, "c");
+    this.text(`Adaptation Points: ${Math.trunc(this.ap)}`, this.f_med, CYAN, WIDTH / 2, 88, "c");
+    if (this.contraction_note) this.text(this.contraction_note, this.f_small, [200, 230, 200], WIDTH / 2, 120, "c");
+    const mem = [...this.antigens].filter(([, v]) => v.state === "memory").map(([k]) => `Strain ${k}`);
+    this.text("Memory now covers: " + (mem.length ? mem.join(", ") : "nothing"), this.f_small, GREEN, WIDTH / 2, 140, "c");
+    const cols = 3, w = 340, h = 130, gap = 20;
+    const sx = Math.floor((WIDTH - (cols * w + (cols - 1) * gap)) / 2);
+    this.upgrade_options.forEach((opt, i) => {
+      const rect = new Rect(sx + (i % cols) * (w + gap), 172 + Math.floor(i / cols) * (h + gap), w, h);
+      const cost = Math.round(opt.cost);
+      const ok = this.ap >= cost;
+      const hover = rect.collidepoint(...input.mouse) && ok;
+      drawRect(ctx, hover ? [60, 56, 76] : (ok ? PANEL_LIGHT : [32, 29, 36]), rect, 0, 10);
+      drawRect(ctx, ok ? (opt.type === "vaccine" ? GREEN : CYAN) : GREY, rect, 2, 10);
+      const [label, desc] = this.upgradeText(opt);
+      this.text(label, this.f_bold, ok ? WHITE : GREY, rect.x + 14, rect.y + 12);
+      this.wrap(desc, this.f_small, w - 28).slice(0, 3).forEach((line, li) =>
+        this.text(line, this.f_small, [210, 205, 220], rect.x + 14, rect.y + 40 + li * 17));
+      this.text(`${cost} AP`, this.f_bold, ok ? YELLOW : GREY, rect.x + 14, rect.bottom - 28);
+      if (ok) this.click_targets.push([rect, () => this.buyUpgrade(opt)]);
+    });
+    const fy = 172 + 2 * (h + gap) + 4;
+    this.wrap("Did you know? " + this.fact, this.f, 900).forEach((line, li) =>
+      this.text(line, this.f, [180, 220, 240], WIDTH / 2, fy + li * 22, "c"));
+    const names = this.next_entries.map(i => this.entries[i].name).join(", ");
+    this.text(`Expected next strain: ${this.next_strain.antigen}  -  entering from: ${names}`,
+              this.f_small, ORANGE, WIDTH / 2, HEIGHT - 110, "c");
+    this.button([WIDTH / 2 - 130, HEIGHT - 84, 260, 54], "Back to the colony", () => { this.state = "PLAYING"; },
+                "primary", true, this.f_med);
+  }
+  drawEnd(won) {
+    this.drawGame();
+    this.dim(210);
+    const r = new Rect(WIDTH / 2 - 290, 130, 580, 470);
+    this.panel(r);
+    let sub;
+    if (won) {
+      this.text("IMMUNITY ACHIEVED", this.f_big, GREEN, r.centerx, r.y + 24, "c");
+      sub = `Your colony survived all ${WIN_WAVE} infections!`;
+    } else {
+      this.text("THE LYMPH NODE FELL", this.f_big, RED, r.centerx, r.y + 24, "c");
+      sub = `The virus overwhelmed your lymph node during wave ${this.wave}.`;
+    }
+    this.text(sub, this.f, WHITE, r.centerx, r.y + 84, "c");
+    const secs = Math.trunc(this.stats.time);
+    const mem = [...this.antigens.values()].filter(v => v.state === "memory").length;
+    const rows = [["Waves survived", String(this.wave - (won ? 0 : 1))],
+                  ["Virus particles destroyed", String(this.stats.killed)],
+                  ["Cells infected", String(this.stats.infections)],
+                  ["Infected cells killed before bursting", String(this.stats.apoptosis)],
+                  ["Cells that burst", String(this.stats.lost_workers)],
+                  ["Strains in immune memory", String(mem)],
+                  ["Time", `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`]];
+    rows.forEach(([k, v], i) => {
+      this.text(k, this.f, GREY, r.x + 70, r.y + 124 + i * 30);
+      this.text(v, this.f_bold, WHITE, r.right - 70, r.y + 124 + i * 30, "r");
+    });
+    this.button([r.x + 60, r.bottom - 76, 200, 50], "Play Again", () => this.newGame(), "primary", true, this.f_med);
+    this.button([r.right - 260, r.bottom - 76, 200, 50], "Main Menu", () => { this.has_game = false; this.state = "MENU"; },
+                "normal", true, this.f_med);
+  }
+
+  // ============================== main loop ==============================
+  draw(dt) {
+    this.click_targets = [];
+    const st = this.state;
+    if (st === "MENU") this.drawMenu(dt);
+    else if (st === "HOWTO") this.drawHowto(dt);
+    else if (st === "OPTIONS") this.drawOptions(dt);
+    else if (st === "PLAYING") this.drawGame();
+    else if (st === "PAUSED") this.drawPause();
+    else if (st === "ADAPT") this.drawAdapt();
+    else if (st === "GAMEOVER" || st === "VICTORY") this.drawEnd(st === "VICTORY");
+  }
+  step(dt) {
+    this.time += dt;
+    if (this.state === "PLAYING") {
+      this.updateCamera(dt);
+      if (!this.paused) {
+        for (let i = 0; i < this.speed; i++) {
+          this.updateSim(dt);
+          if (this.state !== "PLAYING") break;
+        }
+        this.updateFx(dt * this.speed);
+      }
+    }
+  }
+}
+
+// ---------------------------- BOOT & EVENTS -----------------------------
+const game = new Game();
+
+function toGame(e) {
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) * WIDTH / r.width, (e.clientY - r.top) * HEIGHT / r.height];
+}
+
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+canvas.addEventListener("pointerdown", e => {
+  canvas.focus();
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* not supported */ }
+  const pos = toGame(e);
+  input.mouse = pos;
+  const button = e.button + 1;   // pygame numbering: 1 left, 2 middle, 3 right
+  e.preventDefault();
+  if (button === 1 && game.handleClick(...pos)) return;
+  if (game.state === "PLAYING" && VIEW_RECT.collidepoint(...pos)) game.worldMouseDown(button, pos);
+});
+canvas.addEventListener("pointermove", e => {
+  input.mouse = toGame(e);
+  game.mouseMotion(input.mouse);
+});
+canvas.addEventListener("pointerup", e => {
+  input.mouse = toGame(e);
+  if (game.state === "PLAYING") game.mouseUp(e.button + 1, input.mouse, e.shiftKey);
+});
+
+const KEYMAP = { Escape: "escape", Enter: "enter", " ": " ", Tab: "tab", Delete: "delete", Backspace: "delete" };
+window.addEventListener("keydown", e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  input.keys.add(e.code);
+  if ([" ", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) e.preventDefault();
+  if (e.repeat) return;
+  const key = KEYMAP[e.key] || (e.key.length === 1 ? e.key.toLowerCase() : null);
+  if (key) game.handleKey(key);
+});
+window.addEventListener("keyup", e => input.keys.delete(e.code));
+window.addEventListener("blur", () => input.keys.clear());
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  game.step(dt);
+  game.draw(dt);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+canvas.focus();
+</script>
+</body>
+</html>
